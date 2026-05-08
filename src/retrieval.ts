@@ -1,0 +1,381 @@
+// retrieval.ts
+// FTS5 lexical search over claude-indexer's metadata.db.
+// The relay keeps a query_only preflight connection for invariants and runs
+// potentially expensive FTS queries inside a Worker so they can be terminated.
+
+import { Database } from "bun:sqlite";
+import { accessSync, constants } from "fs";
+import { homedir } from "os";
+import { dirname, join } from "path";
+
+const DB_PATH = process.env.INDEXER_DB
+  ?? join(homedir(), ".local-search", "metadata.db");
+
+const SCOPE_PATTERNS = [
+  join(homedir(), "ObsidianVault") + "/%",
+  join(homedir(), ".claude/projects") + "/%/memory/%",
+  join(homedir(), ".claude/memory") + "/%",
+  join(homedir(), "Desktop", "Exam_Prep", "Textbooks") + "/%",
+];
+
+const PATH_FALLBACK_ROOTS = [
+  join(homedir(), "Desktop", "Exam_Prep", "Textbooks"),
+];
+
+const FTS_TIMEOUT_MS = Number(process.env.FTS_TIMEOUT_MS ?? "8000");
+
+let _db: Database | null = null;
+
+function getDb(): Database {
+  if (!_db) {
+    // NOT readonly: bun:sqlite read-only mode cannot coordinate with the
+    // watcher's WAL-mode connection when ~/.local-search/metadata.db-shm gets
+    // checkpointed away. Open read-write to allow -shm regeneration, then force
+    // query_only and verify writes fail.
+    _db = new Database(DB_PATH, { readwrite: true, create: false });
+
+    try {
+      _db.exec("PRAGMA query_only = ON;");
+    } catch (err) {
+      console.error("[retrieval] PRAGMA query_only=ON failed:", err);
+    }
+
+    try {
+      const result = _db
+        .query("PRAGMA query_only")
+        .get() as { query_only: number } | null;
+      if (result?.query_only !== 1) {
+        console.error(
+          "[retrieval] WARNING: PRAGMA query_only did not engage; got:",
+          result,
+        );
+      }
+    } catch (err) {
+      console.error("[retrieval] PRAGMA query_only readback failed:", err);
+    }
+
+    let probeOutcome:
+      | "success-fatal"
+      | "expected-readonly"
+      | "other-error"
+      | "skipped" = "other-error";
+    let savepointActive = false;
+
+    try {
+      _db.exec("SAVEPOINT readonly_probe");
+      savepointActive = true;
+    } catch (err) {
+      console.error(
+        "[retrieval] readonly probe SAVEPOINT setup failed; skipping probe:",
+        err,
+      );
+      probeOutcome = "skipped";
+    }
+
+    if (savepointActive) {
+      try {
+        _db.exec("CREATE TABLE __readonly_probe__ (x INTEGER)");
+        probeOutcome = "success-fatal";
+      } catch (err) {
+        const msg = String((err as Error).message).toLowerCase();
+        if (msg.includes("readonly")) {
+          probeOutcome = "expected-readonly";
+        } else {
+          console.error("[retrieval] readonly probe non-readonly error:", err);
+        }
+      }
+
+      try {
+        _db.exec("ROLLBACK TO readonly_probe");
+        _db.exec("RELEASE readonly_probe");
+      } catch {
+        // Best-effort cleanup; fatal handling below preserves the invariant.
+      }
+    }
+
+    if (probeOutcome === "expected-readonly") {
+      console.log("[retrieval] readonly invariant verified");
+    } else {
+      const fatal = new Error(
+        `readonly invariant not verified (outcome=${probeOutcome})`,
+      );
+      console.error("[retrieval] FATAL:", fatal.message);
+      throw fatal;
+    }
+
+    try {
+      const ver = _db
+        .query("SELECT sqlite_version() AS v")
+        .get() as { v: string };
+      console.log("[retrieval] sqlite_version:", ver.v);
+    } catch (err) {
+      console.error("[retrieval] sqlite_version probe failed:", err);
+    }
+
+    try {
+      accessSync(dirname(DB_PATH), constants.W_OK);
+    } catch {
+      console.error(
+        "[retrieval] WARNING: indexer DB directory is not writable; -shm rotation will fail",
+      );
+    }
+  }
+  return _db;
+}
+
+export async function preflight(): Promise<void> {
+  const db = getDb();
+  const ver = db
+    .query("SELECT sqlite_version() AS v")
+    .get() as { v: string };
+  console.log("[preflight] sqlite:", ver.v);
+
+  const hits = await search('"personal" "stack" "architecture"', 1);
+  if (hits.length === 0) {
+    throw new Error("preflight: FTS returned 0 hits for stable architecture probe");
+  }
+  console.log("[preflight] FTS sanity: architecture probe returns hits");
+}
+
+export interface Hit {
+  chunk_id: number;
+  file_path: string;
+  content: string;
+  chunk_index: number;
+  rank_score: number;       // FTS5 rank, lower is better
+  display_score: number;    // Higher is better, for logs/UI only
+  score: number;            // Backward-compatible alias for display_score
+}
+
+interface RetrievedRow {
+  id: number;
+  text: string;
+  path: string;
+  chunk_index: number;
+  rank_score: number;
+}
+
+const SCOPE_CLAUSE =
+  "(" + SCOPE_PATTERNS.map(() => "f.path LIKE ?").join(" OR ") + ")";
+
+const DENY_CLAUSE = [
+  "f.path NOT LIKE ?",
+  "f.path NOT LIKE ?",
+  "f.path NOT LIKE ?",
+  "f.path NOT LIKE ?",
+  "f.path NOT LIKE ?",
+  "f.path NOT LIKE ?",
+].join(" AND ");
+
+const DENY_PATTERNS = [
+  join(homedir(), "ObsidianVault", "models") + "/%",
+  "%.bin",
+  "%/tokenizer.json",
+  "%/tokenizer_config.json",
+  "%/special_tokens_map.json",
+  "%/.DS_Store",
+];
+
+const SEARCH_SQL = `
+SELECT c.id AS id,
+       c.text AS text,
+       f.path AS path,
+       c.chunk_index AS chunk_index,
+       rank AS rank_score
+  FROM chunks_fts
+  JOIN chunks c ON c.id = chunks_fts.rowid
+  JOIN files f ON f.id = c.file_id
+ WHERE chunks_fts MATCH ?
+   AND ${SCOPE_CLAUSE}
+   AND ${DENY_CLAUSE}
+ ORDER BY rank
+ LIMIT ?
+`;
+
+const PATH_ANCHOR_STOPWORDS = new Set([
+  "textbook",
+  "textbooks",
+  "book",
+  "books",
+]);
+
+const PATH_FALLBACK_TRIGGERS = new Set([
+  "anesthesia",
+  "barash",
+  "miller",
+]);
+
+function pathTokensFromQuery(query: string): string[] {
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+  let shouldSearchPaths = false;
+  for (const token of query.toLowerCase().split(/\s+/)) {
+    const cleaned = token.replace(/[^a-z0-9]/g, "");
+    if (cleaned.length < 4) continue;
+    if (PATH_FALLBACK_TRIGGERS.has(cleaned)) shouldSearchPaths = true;
+    if (PATH_ANCHOR_STOPWORDS.has(cleaned)) continue;
+    if (seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    tokens.push(cleaned);
+  }
+  if (!shouldSearchPaths) return [];
+
+  const namedTitles = tokens.filter((token) =>
+    token === "miller" || token === "barash"
+  );
+  if (namedTitles.length > 0) return namedTitles.slice(0, 2);
+
+  return tokens.slice(0, 2);
+}
+
+function caseTolerantGlobToken(token: string): string {
+  return `[${token[0].toLowerCase()}${token[0].toUpperCase()}]${token.slice(1)}`;
+}
+
+function sanitizeFtsQuery(query: string): string {
+  // buildSearchQuery already strips non-alphanumerics from tokens and wraps each
+  // in literal quotes, so the wrapping `"` chars are the only quotes the
+  // sanitizer can ever see. Stripping them yields whitespace-separated tokens
+  // which FTS5 treats as implicit AND — same semantics as quoted phrases of
+  // single tokens. Plan §3c requires `"` in the escape set as belt-and-braces.
+  return query.replace(/[+~"*()^:\-]/g, " ").replace(/\s+/g, " ").trim();
+}
+
+function displayScore(rankScore: number): number {
+  return rankScore < 0 ? -rankScore : 1 / (1 + rankScore);
+}
+
+function toHit(row: RetrievedRow): Hit {
+  const display = displayScore(Number(row.rank_score));
+  return {
+    chunk_id: row.id,
+    file_path: row.path,
+    content: row.text,
+    chunk_index: row.chunk_index,
+    rank_score: Number(row.rank_score),
+    display_score: display,
+    score: display,
+  };
+}
+
+async function runFtsInWorker(
+  sql: string,
+  params: unknown[],
+): Promise<{ rows: unknown[]; ms: number }> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./fts-worker.ts", import.meta.url).href);
+
+    const timer = setTimeout(() => {
+      try {
+        worker.terminate();
+      } catch {
+        // Already gone.
+      }
+      reject(new Error(`fts_timeout_${FTS_TIMEOUT_MS}ms`));
+    }, FTS_TIMEOUT_MS);
+
+    worker.onmessage = (event: MessageEvent) => {
+      clearTimeout(timer);
+      const data = event.data as { rows?: unknown[]; ms?: number; error?: string };
+      try {
+        worker.terminate();
+      } catch {
+        // Ignore.
+      }
+      if (data.error) {
+        reject(new Error(data.error));
+      } else {
+        resolve({ rows: data.rows ?? [], ms: data.ms ?? 0 });
+      }
+    };
+
+    worker.onerror = (err: ErrorEvent) => {
+      clearTimeout(timer);
+      try {
+        worker.terminate();
+      } catch {
+        // Ignore.
+      }
+      reject(new Error(err.message || "worker_error"));
+    };
+
+    worker.postMessage({ sql, params });
+  });
+}
+
+export async function search(query: string, k = 8): Promise<Hit[]> {
+  const safe = sanitizeFtsQuery(query);
+  if (!safe) return [];
+
+  const safeK = Math.min(Math.max(1, k | 0), 50);
+  const params = [safe, ...SCOPE_PATTERNS, ...DENY_PATTERNS, safeK];
+  const { rows } = await runFtsInWorker(SEARCH_SQL, params);
+  const ftsHits = (rows as RetrievedRow[]).map(toHit);
+  let pathHits: Hit[] = [];
+  try {
+    pathHits = await searchPathAnchors(safe, safeK);
+  } catch (err) {
+    console.error(
+      "[retrieval] path fallback failed:",
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+  const combined: Hit[] = [];
+  const seen = new Set<number>();
+
+  for (const hit of [...pathHits, ...ftsHits]) {
+    if (seen.has(hit.chunk_id)) continue;
+    seen.add(hit.chunk_id);
+    combined.push(hit);
+    if (combined.length >= safeK) break;
+  }
+
+  return combined;
+}
+
+async function searchPathAnchors(query: string, k: number): Promise<Hit[]> {
+  const tokens = pathTokensFromQuery(query);
+  if (tokens.length === 0) return [];
+
+  const pathPatterns = PATH_FALLBACK_ROOTS.flatMap((root) =>
+    tokens.map((token) => `${root}/*${caseTolerantGlobToken(token)}*`)
+  );
+  const pathClause = pathPatterns.map(() => "f.path GLOB ?").join(" OR ");
+  const sql = `
+SELECT -f.id AS id,
+       'Indexed file path match. extraction_status=' || COALESCE(f.extraction_status, 'unknown') ||
+       '; chunk_count=' || COALESCE(f.chunk_count, 0) AS text,
+       f.path AS path,
+       0 AS chunk_index,
+       -1.0 AS rank_score
+  FROM files f
+ WHERE (${pathClause})
+   AND ${DENY_CLAUSE}
+ ORDER BY f.path
+ LIMIT ?
+`;
+
+  const params = [
+    ...pathPatterns,
+    ...DENY_PATTERNS,
+    k,
+  ];
+  const { rows } = await runFtsInWorker(sql, params);
+  return (rows as RetrievedRow[]).map(toHit);
+}
+
+const MAX_HITS_INJECTED = 3;
+const MAX_CHARS_PER_HIT = 900;
+
+export function renderContext(hits: Hit[]): string {
+  if (hits.length === 0) return "";
+  const top = hits.slice(0, MAX_HITS_INJECTED);
+  const blocks = top.map((hit, i) => {
+    const content =
+      hit.content.length > MAX_CHARS_PER_HIT
+        ? hit.content.slice(0, MAX_CHARS_PER_HIT) + "..."
+        : hit.content;
+    return `[${i + 1}] ${hit.file_path} (chunk ${hit.chunk_index}, rank ${hit.rank_score.toFixed(3)}, score ${hit.display_score.toFixed(2)})\n${content}`;
+  });
+  return `RELEVANT INDEXED CONTENT:\n${blocks.join("\n\n")}`;
+}

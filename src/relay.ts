@@ -11,6 +11,7 @@ import { Bot, Context } from "grammy";
 import { spawn } from "bun";
 import { writeFile, mkdir, readFile, unlink } from "fs/promises";
 import { join, dirname } from "path";
+import { homedir } from "os";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import { transcribe } from "./transcribe.ts";
 import {
@@ -18,6 +19,18 @@ import {
   getMemoryContext,
   getRelevantContext,
 } from "./memory.ts";
+import { search as ftsSearch, renderContext as renderFtsContext, preflight as retrievalPreflight } from "./retrieval.ts";
+import { isReferential } from "./trigger.ts";
+import { buildSearchQuery, countContentTokens, type Turn } from "./query-builder.ts";
+import { loadTurns, appendTurn } from "./short-term.ts";
+import { buildSkippedTextbookResponse } from "./textbook-response.ts";
+import {
+  clearUpdateMarker,
+  loadSeenUpdateIds,
+  logDecision,
+  markUpdateStarted,
+  type DecisionRecord,
+} from "./decision-log.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -29,7 +42,17 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "";
 const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
+// Pin the cwd for every `claude` spawn so future --resume work (Phase 1.1)
+// can locate session JSONLs in a stable project bucket. Per
+// platform.claude.com/docs/en/agent-sdk/sessions, sessions are stored under
+// ~/.claude/projects/<encoded-cwd>/<session-id>.jsonl with non-alphanumerics
+// replaced by '-'. Inheriting launchd's cwd ('/') would scatter sessions.
+const RELAY_CWD = (process.env.HOME ?? "") + "/Projects/claude-telegram-relay";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
+const CLAUDE_TIMEOUT_MS = 5 * 60 * 1000;
+const KILL_GRACE_MS = 10_000;
+const MAX_PROMPT_CHARS = 120_000;
+const MAX_RECENT_TURNS_RENDERED = 6;
 
 // Directories
 const TEMP_DIR = join(RELAY_DIR, "temp");
@@ -162,6 +185,40 @@ if (!(await acquireLock())) {
 
 const bot = new Bot(BOT_TOKEN);
 
+const seenUpdates: Set<number> = await loadSeenUpdateIds();
+let retrievalAvailable = false;
+let retrievalStartupError: string | undefined;
+
+bot.use(async (ctx, next) => {
+  const updateId = ctx.update.update_id;
+  if (seenUpdates.has(updateId)) {
+    return;
+  }
+
+  seenUpdates.add(updateId);
+  await markUpdateStarted(updateId);
+
+  try {
+    await next();
+    await clearUpdateMarker(updateId);
+  } catch (err) {
+    await logDecision({
+      ts: new Date().toISOString(),
+      update_id: updateId,
+      chat_id: ctx.chat?.id ?? 0,
+      message: ctx.message && "text" in ctx.message ? ctx.message.text ?? "" : "",
+      trigger_fired: false,
+      hit_count: 0,
+      hits_summary: [],
+      injected_count: 0,
+      total_ms: 0,
+      error: err instanceof Error ? err.message : String(err),
+    }).catch(() => undefined);
+    await clearUpdateMarker(updateId);
+    throw err;
+  }
+});
+
 // ============================================================
 // SECURITY: Only respond to authorized user
 // ============================================================
@@ -198,21 +255,47 @@ async function callClaude(
 
   console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
 
+  const ac = new AbortController();
+  let timedOut = false;
+  const proc = spawn(args, {
+    stdout: "pipe",
+    stderr: "pipe",
+    cwd: RELAY_CWD,
+    env: {
+      ...process.env,
+    },
+    signal: ac.signal,
+  });
+
+  const sigTermTimer = setTimeout(() => {
+    if (proc.exitCode === null) {
+      timedOut = true;
+      console.error(`[callClaude] timeout after ${CLAUDE_TIMEOUT_MS}ms, sending SIGTERM`);
+      ac.abort();
+    }
+  }, CLAUDE_TIMEOUT_MS);
+
+  const sigKillTimer = setTimeout(() => {
+    if (proc.exitCode === null) {
+      console.error("[callClaude] grace expired, sending SIGKILL");
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // Already dead.
+      }
+    }
+  }, CLAUDE_TIMEOUT_MS + KILL_GRACE_MS);
+
   try {
-    const proc = spawn(args, {
-      stdout: "pipe",
-      stderr: "pipe",
-      cwd: PROJECT_DIR || undefined,
-      env: {
-        ...process.env,
-        // Pass through any env vars Claude might need
-      },
-    });
+    const [output, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
 
-    const output = await new Response(proc.stdout).text();
-    const stderr = await new Response(proc.stderr).text();
-
-    const exitCode = await proc.exited;
+    if (timedOut || ac.signal.aborted) {
+      throw new Error(`claude_timeout_${CLAUDE_TIMEOUT_MS}ms`);
+    }
 
     if (exitCode !== 0) {
       console.error("Claude error:", stderr);
@@ -229,55 +312,248 @@ async function callClaude(
 
     return output.trim();
   } catch (error) {
+    if (timedOut || String((error as Error).message).startsWith("claude_timeout_")) {
+      throw new Error(`claude_timeout_${CLAUDE_TIMEOUT_MS}ms`);
+    }
     console.error("Spawn error:", error);
     return `Error: Could not run Claude CLI`;
+  } finally {
+    clearTimeout(sigTermTimer);
+    clearTimeout(sigKillTimer);
   }
+}
+
+// ============================================================
+// HARDENING HELPERS (Phase 1 v1)
+// ============================================================
+
+// Per-chat FIFO queue. Two messages from the same chat process in order;
+// different chats are independent. Prevents state.json races.
+const chatQueues = new Map<string, Promise<unknown>>();
+
+function enqueue<T>(chatId: string, updateId: number, fn: () => Promise<T>): Promise<T> {
+  const prev = chatQueues.get(chatId) ?? Promise.resolve();
+  const next = prev.catch(() => undefined).then(fn);
+  const logged = next.catch(async (err) => {
+    await logDecision({
+      ts: new Date().toISOString(),
+      update_id: updateId,
+      chat_id: chatId,
+      message: "",
+      trigger_fired: false,
+      hit_count: 0,
+      hits_summary: [],
+      injected_count: 0,
+      total_ms: 0,
+      error: `enqueue_caught: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    throw err;
+  });
+  chatQueues.set(chatId, logged.catch(() => undefined));
+  return logged;
+}
+
+// Defense-in-depth strip of memory-management tags so they never reach the user.
+// Layer 1 (gate the prompt instruction on `supabase`) is in buildPrompt.
+function stripMemoryTags(text: string): { clean: string; stripped: number } {
+  let stripped = 0;
+  const clean = text
+    .replace(/\[REMEMBER:[^\]]*\]/g, () => { stripped++; return ""; })
+    .replace(/\[GOAL:[^\]]*\]/g,     () => { stripped++; return ""; })
+    .replace(/\[DONE:[^\]]*\]/g,     () => { stripped++; return ""; })
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { clean, stripped };
+}
+
+// Plain-text recent-turns renderer (locked v1 decision: no XML in prompts).
+// short-term.ts also exports renderRecentTurns which emits XML; we use this
+// plain-text variant instead.
+function renderRecentTurnsPlain(turns: Turn[], cap = MAX_RECENT_TURNS_RENDERED): string {
+  if (turns.length === 0) return "";
+  const trimmed = turns.slice(-cap);
+  const lines = trimmed.map((t) => `${t.role}: ${t.content}`);
+  return `RECENT CONVERSATION:\n${lines.join("\n")}`;
+}
+
+function capPrompt(prompt: string, userMessage?: string): string {
+  if (prompt.length <= MAX_PROMPT_CHARS) return prompt;
+  const note =
+    `\n\n[TRUNCATED: prompt exceeded relay safety limit of ${MAX_PROMPT_CHARS} chars]`;
+  const userBlock = userMessage === undefined ? "" : `\nUser: ${userMessage}`;
+
+  if (
+    userBlock &&
+    prompt.endsWith(userBlock) &&
+    userBlock.length + note.length + 1000 < MAX_PROMPT_CHARS
+  ) {
+    const headBudget = MAX_PROMPT_CHARS - userBlock.length - note.length;
+    return prompt.slice(0, headBudget) + note + userBlock;
+  }
+
+  return prompt.slice(0, Math.max(0, MAX_PROMPT_CHARS - note.length)) + note;
+}
+
+function ensureSendableResponse(text: string, fallback: string): string {
+  const trimmed = text.trim();
+  return trimmed.length > 0 ? trimmed : fallback;
 }
 
 // ============================================================
 // MESSAGE HANDLERS
 // ============================================================
 
-// Text messages
+// Text messages (Phase 1 v1: trigger-gated FTS, short-term ring buffer,
+// per-chat FIFO queue, decision JSONL, two-layer memory-tag leak fix.)
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
-  console.log(`Message: ${text.substring(0, 50)}...`);
+  const chatId = String(ctx.chat.id);
+  const updateId = ctx.update.update_id;
 
-  await ctx.replyWithChatAction("typing");
+  await enqueue(chatId, updateId, async () => {
+    const t0 = Date.now();
+    const ts = new Date().toISOString();
+    console.log(`Message: ${text.substring(0, 50)}...`);
 
-  await saveMessage("user", text);
+    await ctx.replyWithChatAction("typing");
+    await saveMessage("user", text);
 
-  // Gather context: semantic search + facts/goals
-  const [relevantContext, memoryContext] = await Promise.all([
-    getRelevantContext(supabase, text),
-    getMemoryContext(supabase),
-  ]);
+    // Load recent turns for query builder + prompt block; append the user
+    // turn before retrieval so it's persisted even on later failure.
+    const recentTurns = await loadTurns(chatId);
+    const turnBufferSizeBefore = recentTurns.length;
+    await appendTurn(chatId, { role: "user", content: text, ts });
 
-  const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext);
-  const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+    // Trigger gating: only run FTS on referential messages.
+    const referential = isReferential(text);
+    const queryContentTokens = countContentTokens(text);
+    const searchQuery = referential && retrievalAvailable
+      ? buildSearchQuery(text, recentTurns)
+      : "";
+    const tRetrieval0 = Date.now();
+    let retrievalMs: number | undefined;
+    let timeoutKind: "fts" | "claude" | undefined;
+    let retrievalError: string | undefined = referential && !retrievalAvailable
+      ? `retrieval_unavailable${retrievalStartupError ? `: ${retrievalStartupError}` : ""}`
+      : undefined;
+    let ftsHits: Awaited<ReturnType<typeof ftsSearch>> = [];
+    if (referential && searchQuery) {
+      try {
+        ftsHits = await ftsSearch(searchQuery, 8);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        retrievalError = msg;
+        if (msg.startsWith("fts_timeout_")) timeoutKind = "fts";
+        console.error("[retrieval] search failed:", msg);
+      } finally {
+        retrievalMs = Date.now() - tRetrieval0;
+      }
+    }
 
-  // Parse and save any memory intents, strip tags from response
-  const response = await processMemoryIntents(supabase, rawResponse);
+    // Compose relevant-context block: recent conversation + indexed content
+    // + supabase fallback (inert when Supabase is null).
+    const indexedContent = renderFtsContext(ftsHits);
+    const recentBlock = renderRecentTurnsPlain(recentTurns);
+    const [supabaseContext, memoryContext] = supabase
+      ? await Promise.all([
+          getRelevantContext(supabase, text),
+          getMemoryContext(supabase),
+        ])
+      : ["", ""];
+    const combinedRelevant = [recentBlock, indexedContent, supabaseContext]
+      .filter(Boolean)
+      .join("\n\n");
 
-  await saveMessage("assistant", response);
-  await sendResponse(ctx, response);
+    const enrichedPrompt = capPrompt(buildPrompt(text, combinedRelevant, memoryContext), text);
+
+    const tClaude0 = Date.now();
+    let assistantText = "";
+    let stripped = 0;
+    let errorMsg: string | undefined;
+    const deterministicTextbookResponse = buildSkippedTextbookResponse(text, ftsHits);
+    if (deterministicTextbookResponse) {
+      assistantText = deterministicTextbookResponse;
+    } else {
+      try {
+        const raw = await callClaude(enrichedPrompt, { resume: true });
+        const intentResult = supabase
+          ? await processMemoryIntents(supabase, raw)
+          : raw;
+        const stripResult = stripMemoryTags(intentResult);
+        assistantText = ensureSendableResponse(
+          stripResult.clean,
+          "I’m sorry, I generated an empty response. Please try again.",
+        );
+        stripped = stripResult.stripped;
+      } catch (err) {
+        errorMsg = err instanceof Error ? err.message : String(err);
+        if (errorMsg.startsWith("claude_timeout_")) {
+          timeoutKind = "claude";
+          assistantText = "Sorry, that took too long and I stopped it. Try a narrower request.";
+        } else {
+          assistantText = "Sorry, something went wrong on my end. Try again.";
+        }
+      }
+    }
+    const claudeMs = Date.now() - tClaude0;
+
+    await sendResponse(ctx, assistantText);
+    await saveMessage("assistant", assistantText);
+    await appendTurn(chatId, { role: "assistant", content: assistantText, ts: new Date().toISOString() });
+
+    if (stripped > 0) {
+      console.log(`[memory-tag-leak-strip] stripped ${stripped} tag(s) from response`);
+    }
+
+    const rec: DecisionRecord = {
+      ts,
+      update_id: updateId,
+      chat_id: chatId,
+      message: text,
+      trigger_fired: referential,
+      hit_count: ftsHits.length,
+      hits_summary: ftsHits.slice(0, 5).map((h) => ({
+        path: h.file_path,
+        sim: Number(h.display_score.toFixed(3)),
+      })),
+      injected_count: referential ? Math.min(ftsHits.length, 3) : 0,
+      claude_ms: claudeMs,
+      total_ms: Date.now() - t0,
+      error: errorMsg ?? retrievalError,
+      query_content_tokens: queryContentTokens,
+      fts_query: searchQuery,
+      retrieval_ms: retrievalMs,
+      top_rank_score: ftsHits[0]?.rank_score,
+      second_rank_score: ftsHits[1]?.rank_score,
+      prompt_chars: enrichedPrompt.length,
+      turn_buffer_size_before: turnBufferSizeBefore,
+      timeout_kind: timeoutKind,
+    };
+    await logDecision(rec);
+  });
 });
 
 // Voice messages
 bot.on("message:voice", async (ctx) => {
   const voice = ctx.message.voice;
+  const updateId = ctx.update.update_id;
+  const chatId = String(ctx.chat.id);
+  const t0 = Date.now();
+  const ts = new Date().toISOString();
   console.log(`Voice message: ${voice.duration}s`);
-  await ctx.replyWithChatAction("typing");
 
-  if (!process.env.VOICE_PROVIDER) {
-    await ctx.reply(
-      "Voice transcription is not set up yet. " +
-        "Run the setup again and choose a voice provider (Groq or local Whisper)."
-    );
-    return;
-  }
-
+  let errorMsg: string | undefined;
   try {
+    await ctx.replyWithChatAction("typing");
+
+    if (!process.env.VOICE_PROVIDER) {
+      await ctx.reply(
+        "Voice transcription is not set up yet. " +
+          "Run the setup again and choose a voice provider (Groq or local Whisper)."
+      );
+      return;
+    }
+
     const file = await ctx.getFile();
     const url = `https://api.telegram.org/file/bot${BOT_TOKEN}/${file.file_path}`;
     const response = await fetch(url);
@@ -291,33 +567,61 @@ bot.on("message:voice", async (ctx) => {
 
     await saveMessage("user", `[Voice ${voice.duration}s]: ${transcription}`);
 
-    const [relevantContext, memoryContext] = await Promise.all([
-      getRelevantContext(supabase, transcription),
-      getMemoryContext(supabase),
-    ]);
+    const [relevantContext, memoryContext] = supabase
+      ? await Promise.all([
+          getRelevantContext(supabase, transcription),
+          getMemoryContext(supabase),
+        ])
+      : ["", ""];
 
-    const enrichedPrompt = buildPrompt(
-      `[Voice message transcribed]: ${transcription}`,
+    const voiceUserMessage = `[Voice message transcribed]: ${transcription}`;
+    const enrichedPrompt = capPrompt(buildPrompt(
+      voiceUserMessage,
       relevantContext,
       memoryContext
-    );
+    ), voiceUserMessage);
     const rawResponse = await callClaude(enrichedPrompt, { resume: true });
-    const claudeResponse = await processMemoryIntents(supabase, rawResponse);
+    const claudeResponse = supabase
+      ? await processMemoryIntents(supabase, rawResponse)
+      : rawResponse;
 
     await saveMessage("assistant", claudeResponse);
     await sendResponse(ctx, claudeResponse);
   } catch (error) {
+    errorMsg = error instanceof Error ? error.message : String(error);
     console.error("Voice error:", error);
-    await ctx.reply("Could not process voice message. Check logs for details.");
+    await ctx.reply("Could not process voice message. Check logs for details.").catch(() => undefined);
+  } finally {
+    // Persist update_id so loadSeenUpdateIds() blocks Telegram redelivery on
+    // restart. Without this, voice updates are only tracked via the in-memory
+    // seen-set and short-lived marker file, both lost on relay restart.
+    await logDecision({
+      ts,
+      update_id: updateId,
+      chat_id: chatId,
+      message: `[voice ${voice.duration}s]`,
+      trigger_fired: false,
+      hit_count: 0,
+      hits_summary: [],
+      injected_count: 0,
+      total_ms: Date.now() - t0,
+      error: errorMsg,
+    }).catch(() => undefined);
   }
 });
 
 // Photos/Images
 bot.on("message:photo", async (ctx) => {
+  const updateId = ctx.update.update_id;
+  const chatId = String(ctx.chat.id);
+  const t0 = Date.now();
+  const ts = new Date().toISOString();
   console.log("Image received");
-  await ctx.replyWithChatAction("typing");
 
+  let errorMsg: string | undefined;
   try {
+    await ctx.replyWithChatAction("typing");
+
     // Get highest resolution photo
     const photos = ctx.message.photo;
     const photo = photos[photos.length - 1];
@@ -335,7 +639,7 @@ bot.on("message:photo", async (ctx) => {
 
     // Claude Code can see images via file path
     const caption = ctx.message.caption || "Analyze this image.";
-    const prompt = `[Image: ${filePath}]\n\n${caption}`;
+    const prompt = capPrompt(`[Image: ${filePath}]\n\n${caption}`);
 
     await saveMessage("user", `[Image]: ${caption}`);
 
@@ -344,22 +648,44 @@ bot.on("message:photo", async (ctx) => {
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    const cleanResponse = supabase
+      ? await processMemoryIntents(supabase, claudeResponse)
+      : claudeResponse;
     await saveMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
+    errorMsg = error instanceof Error ? error.message : String(error);
     console.error("Image error:", error);
-    await ctx.reply("Could not process image.");
+    await ctx.reply("Could not process image.").catch(() => undefined);
+  } finally {
+    await logDecision({
+      ts,
+      update_id: updateId,
+      chat_id: chatId,
+      message: "[photo]",
+      trigger_fired: false,
+      hit_count: 0,
+      hits_summary: [],
+      injected_count: 0,
+      total_ms: Date.now() - t0,
+      error: errorMsg,
+    }).catch(() => undefined);
   }
 });
 
 // Documents
 bot.on("message:document", async (ctx) => {
   const doc = ctx.message.document;
+  const updateId = ctx.update.update_id;
+  const chatId = String(ctx.chat.id);
+  const t0 = Date.now();
+  const ts = new Date().toISOString();
   console.log(`Document: ${doc.file_name}`);
-  await ctx.replyWithChatAction("typing");
 
+  let errorMsg: string | undefined;
   try {
+    await ctx.replyWithChatAction("typing");
+
     const file = await ctx.getFile();
     const timestamp = Date.now();
     const fileName = doc.file_name || `file_${timestamp}`;
@@ -372,7 +698,7 @@ bot.on("message:document", async (ctx) => {
     await writeFile(filePath, Buffer.from(buffer));
 
     const caption = ctx.message.caption || `Analyze: ${doc.file_name}`;
-    const prompt = `[File: ${filePath}]\n\n${caption}`;
+    const prompt = capPrompt(`[File: ${filePath}]\n\n${caption}`);
 
     await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
 
@@ -380,12 +706,28 @@ bot.on("message:document", async (ctx) => {
 
     await unlink(filePath).catch(() => {});
 
-    const cleanResponse = await processMemoryIntents(supabase, claudeResponse);
+    const cleanResponse = supabase
+      ? await processMemoryIntents(supabase, claudeResponse)
+      : claudeResponse;
     await saveMessage("assistant", cleanResponse);
     await sendResponse(ctx, cleanResponse);
   } catch (error) {
+    errorMsg = error instanceof Error ? error.message : String(error);
     console.error("Document error:", error);
-    await ctx.reply("Could not process document.");
+    await ctx.reply("Could not process document.").catch(() => undefined);
+  } finally {
+    await logDecision({
+      ts,
+      update_id: updateId,
+      chat_id: chatId,
+      message: `[document: ${doc.file_name ?? "unnamed"}]`,
+      trigger_fired: false,
+      hit_count: 0,
+      hits_summary: [],
+      injected_count: 0,
+      total_ms: Date.now() - t0,
+      error: errorMsg,
+    }).catch(() => undefined);
   }
 });
 
@@ -430,14 +772,18 @@ function buildPrompt(
   if (memoryContext) parts.push(`\n${memoryContext}`);
   if (relevantContext) parts.push(`\n${relevantContext}`);
 
-  parts.push(
-    "\nMEMORY MANAGEMENT:" +
-      "\nWhen the user shares something worth remembering, sets goals, or completes goals, " +
-      "include these tags in your response (they are processed automatically and hidden from the user):" +
-      "\n[REMEMBER: fact to store]" +
-      "\n[GOAL: goal text | DEADLINE: optional date]" +
-      "\n[DONE: search text for completed goal]"
-  );
+  // Layer 1 of memory-tag leak fix: only ask Claude to emit tags when there is
+  // a Supabase to store them. Layer 2 (response strip) is in the text handler.
+  if (supabase) {
+    parts.push(
+      "\nMEMORY MANAGEMENT:" +
+        "\nWhen the user shares something worth remembering, sets goals, or completes goals, " +
+        "include these tags in your response (they are processed automatically and hidden from the user):" +
+        "\n[REMEMBER: fact to store]" +
+        "\n[GOAL: goal text | DEADLINE: optional date]" +
+        "\n[DONE: search text for completed goal]"
+    );
+  }
 
   parts.push(`\nUser: ${userMessage}`);
 
@@ -447,6 +793,10 @@ function buildPrompt(
 async function sendResponse(ctx: Context, response: string): Promise<void> {
   // Telegram has a 4096 character limit
   const MAX_LENGTH = 4000;
+  response = ensureSendableResponse(
+    response,
+    "I’m sorry, I generated an empty response. Please try again.",
+  );
 
   if (response.length <= MAX_LENGTH) {
     await ctx.reply(response);
@@ -482,9 +832,45 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
 // START
 // ============================================================
 
-console.log("Starting Claude Telegram Relay...");
-console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
-console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
+async function runStartupPreflight(): Promise<void> {
+  console.log("Starting Claude Telegram Relay...");
+  console.log(`Authorized user: ${ALLOWED_USER_ID || "ANY (not recommended)"}`);
+  console.log(`Project directory: ${PROJECT_DIR || "(relay working directory)"}`);
+  console.log("[relay] RELAY_CWD:", RELAY_CWD);
+
+  console.log("[relay] running retrieval preflight...");
+  try {
+    await retrievalPreflight();
+    retrievalAvailable = true;
+    retrievalStartupError = undefined;
+  } catch (err) {
+    retrievalAvailable = false;
+    retrievalStartupError = err instanceof Error ? err.message : String(err);
+    console.error(
+      "[relay] retrieval preflight failed; continuing without indexed retrieval:",
+      retrievalStartupError,
+    );
+  }
+
+  const watcher = Bun.spawnSync({ cmd: ["pgrep", "-f", "watcher.py"] });
+  if (watcher.exitCode !== 0) {
+    console.error("[preflight] watcher.py not running; indexed content may be stale");
+  } else {
+    console.log("[preflight] watcher.py: alive");
+  }
+
+  await mkdir(join(homedir(), ".claude-relay", "state", "updates"), { recursive: true });
+  await mkdir(join(homedir(), ".claude-relay", "logs"), { recursive: true });
+  await Bun.write(join(homedir(), ".claude-relay", "state", ".write-probe"), "");
+
+  const me = await bot.api.getMe();
+  if (!me.is_bot) throw new Error("preflight: getMe returned non-bot");
+  console.log(`[preflight] Telegram getMe: @${me.username} (id=${me.id})`);
+
+  console.log("[relay] retrieval preflight complete");
+}
+
+await runStartupPreflight();
 
 bot.start({
   onStart: () => {
