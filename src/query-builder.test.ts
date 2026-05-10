@@ -91,6 +91,34 @@ test("topic-pivot with new clinical content does not pull in prior anchor", () =
   ).toBe('"chestnut" "anesthesia"');
 });
 
+// Live decision-log entry (2026-05-10T21:08:13Z): the message
+// "Compare the differences in how opioids affect an epidural in kids
+//  versus adults between cote and barash"
+// produced FTS query `"differences" "epidural" "compare" "opioids" "adults"`
+// — both "cote" and "barash" got pushed out of the top-5 by longer adjectives.
+// retrieval.prepareFtsQuery uses book tokens to route to BOOK_PATH_FILTERS
+// scopes, so losing them collapsed the search back to the broad scope and
+// returned 1 incidental cote hit instead of cote+barash content.
+test("pins book-name anchors over longer clinical adjectives", () => {
+  const query = buildSearchQuery(
+    "Compare the differences in how opioids affect an epidural in kids versus adults between cote and barash",
+    [],
+  );
+  expect(query).toContain('"cote"');
+  expect(query).toContain('"barash"');
+});
+
+test("book anchors plus longest clinical adjectives fill the rest of the cap", () => {
+  // Same message: anchors first (cote, barash), then top-3 by length among
+  // the remaining clinical tokens.
+  expect(
+    buildSearchQuery(
+      "Compare the differences in how opioids affect an epidural in kids versus adults between cote and barash",
+      [],
+    ),
+  ).toBe('"cote" "barash" "differences" "epidural" "compare"');
+});
+
 test("source-redirection without prior context still returns no query", () => {
   expect(
     buildSearchQuery(

@@ -13,6 +13,21 @@ const MAX_MATCH_TOKENS = 5;
 const MIN_TOKEN_LEN = 3;
 const MAX_QUERY_CHARS = 256;
 
+// Known textbook anchor tokens. retrieval.ts converts these into BOOK_PATH_FILTERS
+// scopes — so they are the most valuable tokens we can preserve in the query.
+// Pinned ahead of the length-based selection so multi-book comparison queries
+// like "compare cote and barash on epidural opioids" don't drop the book names
+// in favour of longer clinical adjectives.
+// Must stay in sync with BOOK_PATH_FILTERS keys in retrieval.ts.
+const BOOK_NAME_ANCHORS: ReadonlySet<string> = new Set([
+  "barash",
+  "chestnut",
+  "cote",
+  "fleisher",
+  "miller",
+  "stoelting",
+]);
+
 const FTS5_RESERVED = new Set(["AND", "OR", "NOT", "NEAR"]);
 
 // Source/format-redirection vocabulary. These words describe *how* the user
@@ -154,9 +169,15 @@ export function buildSearchQuery(
   if (unique.length <= MAX_MATCH_TOKENS) {
     chosen = unique;
   } else {
-    chosen = [...unique]
-      .sort((a, b) => b.length - a.length || a.localeCompare(b))
-      .slice(0, MAX_MATCH_TOKENS);
+    // Pin book-name anchors first; they route retrieval to BOOK_PATH_FILTERS
+    // scopes in retrieval.ts and are usually the highest-precision signal.
+    const bookAnchors = unique.filter((t) => BOOK_NAME_ANCHORS.has(t));
+    const others = unique
+      .filter((t) => !BOOK_NAME_ANCHORS.has(t))
+      .sort((a, b) => b.length - a.length || a.localeCompare(b));
+    const cappedAnchors = bookAnchors.slice(0, MAX_MATCH_TOKENS);
+    const remaining = MAX_MATCH_TOKENS - cappedAnchors.length;
+    chosen = [...cappedAnchors, ...others.slice(0, remaining)];
   }
 
   // Use implicit AND. On this DB, broad OR/rank queries over common terms can

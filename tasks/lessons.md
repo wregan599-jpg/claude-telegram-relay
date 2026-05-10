@@ -112,6 +112,28 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-10 - Pin book-name anchors over longer clinical adjectives
+
+- Live decision log 2026-05-10T21:08:13Z: "Compare the differences in how
+  opioids affect an epidural in kids versus adults between cote and barash"
+  produced FTS query `"differences" "epidural" "compare" "opioids" "adults"`.
+  Both "cote" and "barash" got pushed out of the top-5 by the length-desc
+  selection in `buildSearchQuery`, so `retrieval.prepareFtsQuery` never saw
+  them and the BOOK_PATH_FILTERS routing was bypassed. Result: 1 incidental
+  cote hit, no barash content, response was rated "Unacceptable".
+- Book-name tokens are the highest-precision signal we have for textbook
+  questions because they switch FTS from broad scope-pattern search to a
+  tight per-book path scope. `query-builder.ts` now pins all tokens in
+  `BOOK_NAME_ANCHORS` (must stay in sync with `BOOK_PATH_FILTERS` keys in
+  retrieval.ts) before applying the length sort to the rest.
+- Multi-book comparison queries work for free now: FTS gets multiple
+  book-path scopes ORed together and ANDs the clinical content terms inside
+  those scopes, so "compare cote and barash on X" returns relevant pages
+  from both books rather than 0 hits or one accidental match.
+- When extending the corpus to a new book, add the lowercase key to
+  `BOOK_PATH_FILTERS` (retrieval.ts), the trigger regex (trigger.ts), and
+  `BOOK_NAME_ANCHORS` (query-builder.ts) in the same change.
+
 ## 2026-05-10 - Telegram default reply style: concise, scannable, bulleted
 
 - User feedback (saved in memory `feedback_response_style.md`): bullets over
