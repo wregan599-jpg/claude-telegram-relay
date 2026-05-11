@@ -112,6 +112,26 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-10 - Writing-style rules baked into the relay system prompt
+
+- Cross-project rule set (`~/ObsidianVault/02-Cross-Project/writing_style_for_william.md`)
+  must apply automatically to anything the bot drafts on the user's behalf
+  (emails, iMessages, letters, notes). User has flagged AI-sounding drafts
+  repeatedly and rejects them.
+- A Mother's Day note drafted via the relay on 2026-05-10 violated the rule
+  set four times in one short message (em dashes) and read with monotone
+  cadence. Trigger for the integration: user said "ensure this is part of
+  the Telegram pathway as well" after the rewrite.
+- Inlined a concise version of the rules in `buildPrompt`'s system prompt
+  with explicit scoping ("when drafting outgoing text on the user's behalf").
+  Kept the existing concise/scannable directive so technical/clinical replies
+  still use bullets. Full rules referenced by path so Claude can read them
+  if needed.
+- Rules to scan for in any draft going out under his name:
+  zero em dashes, no AI vocab (delve/leverage/navigate/etc.), no form-letter
+  phrases, no stiff transitions, no parallel-bullet overload, vary rhythm,
+  contractions on.
+
 ## 2026-05-10 - Strip bare XML wrapper tags from Claude responses
 
 - Live failure 2026-05-10T21:08:25 and again at 21:58:25: Claude emitted the
