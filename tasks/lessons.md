@@ -112,6 +112,33 @@
   always merge the top anchor tokens from the prior user turn alongside the
   current message's tokens.
 
+## 2026-05-11 - iMessage and email draft helpers; FDA scoped to Claude CLI
+
+- User asked for the relay to be able to read iMessage context and drop
+  drafts into the native compose surface for iMessage and email. Hard rule
+  (logged earlier today): never auto-send. Compose-only.
+- Three helper scripts shipped in `scripts/`:
+  - `draft-imessage.sh RECIPIENT` (body on stdin). Pbcopies the body and
+    opens `imessage://RECIPIENT`. No FDA, no Automation, no Accessibility
+    permission. User pastes and sends manually.
+  - `draft-email.sh TO SUBJECT` (body on stdin). Opens a `mailto:` URL
+    with subject+body pre-filled. Body also lands on the clipboard as a
+    safety net against URL truncation. Works for any default mail client.
+  - `imessage-thread.sh RECIPIENT [LIMIT]`. Read-only sqlite3 against
+    `~/Library/Messages/chat.db`. Returns JSON. Requires Full Disk Access
+    on the Claude CLI binary the relay spawns
+    (`~/.local/share/claude/versions/<vN>`). Exits 77 with a pointer to
+    `docs/IMESSAGE-SETUP.md` if FDA is not granted.
+- System prompt updated so the bot knows the helpers exist and which to
+  use for which task. Bot is told to fall back to "draft from description"
+  when FDA is missing rather than invent context.
+- New doc: `docs/IMESSAGE-SETUP.md` explains the FDA grant procedure and
+  enumerates what does NOT work (granting Terminal, granting bun, granting
+  the symlink). Source of truth for the user-facing setup steps.
+- The Claude-CLI-binary granular FDA scope was chosen because the Bash tool
+  that runs `sqlite3` is a child of Claude, and macOS TCC permissions
+  follow the process tree from the granted executable.
+
 ## 2026-05-11 - Strip Claude Code internal scaffolding tags from relay output
 
 - Live failure 2026-05-11T12:54:45Z: in response to "Okay, please draft an

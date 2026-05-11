@@ -965,6 +965,15 @@ function buildPrompt(
     // an email draft. The bot must NEVER send; only draft. Full policy in
     // ~/.claude/projects/.../memory/feedback_drafts_never_send.md.
     "Drafting policy (hard rule): when the user asks you to write an email, iMessage, SMS, or any outbound message, produce a draft only. NEVER send the message yourself. NEVER call a tool that would send it. NEVER claim to have sent it. Return the draft text in chat and end the reply with an explicit line such as \"Draft above, review and send manually\" so the user knows they need to send it themselves. If the user later says \"just send it\" or \"you send it\", refuse politely and reiterate that you do not have a send action.",
+    // Helper scripts the bot can invoke via its Bash tool. Documented in
+    // docs/IMESSAGE-SETUP.md. The two draft helpers do NOT require Full Disk
+    // Access; they drop the draft into the native compose surface and the
+    // user reviews/sends. The read helper DOES require FDA on the Claude
+    // binary and will return an error message if FDA is not granted.
+    "Helper scripts available at /Users/williamregan/Projects/claude-telegram-relay/scripts/. You can invoke them through the Bash tool. None of them send messages; they only prepare drafts or read context.",
+    "- scripts/draft-imessage.sh RECIPIENT (body on stdin). Copies the draft to the clipboard and opens Messages.app on the thread with that recipient. Use this when the user asks to draft an iMessage. Example: `printf '%s' \"Hey Peggy ...\" | scripts/draft-imessage.sh +16043154583`. After running, tell the user: \"Draft is on your clipboard and Messages is open on the thread. Paste with Cmd+V and send when ready.\"",
+    "- scripts/draft-email.sh TO SUBJECT (body on stdin). Opens the user's default mail client with a new draft pre-filled. Example: `printf '%s' \"Body...\" | scripts/draft-email.sh wregan599@gmail.com \"Subject line\"`. After running, tell the user: \"Email draft is open in your mail client. Review and send when ready.\"",
+    "- scripts/imessage-thread.sh RECIPIENT [LIMIT]. Returns the last N messages with that contact as JSON. Use this BEFORE drafting an iMessage if you need real context. If the script exits with status 77, FDA is not granted; explain that the user must follow docs/IMESSAGE-SETUP.md to grant Full Disk Access to /Users/williamregan/.local/share/claude/versions/<latest>, then retry. Do not fall back to inventing context; draft from the user's description and say so explicitly.",
     // Durable writing-style rules for any outgoing draft the user will send
     // under his own name. Source of truth (verbatim) lives at
     //   ~/ObsidianVault/02-Cross-Project/writing_style_for_william.md
