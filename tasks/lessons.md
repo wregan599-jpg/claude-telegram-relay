@@ -214,6 +214,13 @@
   the prompt is dead weight that produces hallucinated "blocked for
   approval" output. Keep the email helper line for now; the user has not
   asked for symmetric email placement yet.
+- Live failure 2026-05-11T16:00:57Z after the post-action shipped:
+  `imessage_draft_status: "helper_failed"` with
+  `imessage_draft_timeout_6000ms`. The relay had correctly found Peggy,
+  read 10 messages, detected placement intent, and got a draft body, but
+  killed the placement helper too aggressively during Messages.app startup.
+  Treat UI-opening helpers as cold-launch operations; use a human-scale
+  timeout and clear the timer after process exit so it cannot fire late.
 
 ## 2026-05-11 - Strip Claude Code internal scaffolding tags from relay output
 

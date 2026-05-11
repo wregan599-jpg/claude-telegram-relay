@@ -16,7 +16,7 @@ export const DRAFT_MARKER_CLOSE = "<<<END_IMESSAGE_DRAFT>>>";
 
 const DRAFT_BLOCK_RE = /<<<IMESSAGE_DRAFT>>>([\s\S]*?)<<<END_IMESSAGE_DRAFT>>>/;
 const ORPHAN_MARKER_RE = /<<<\/?(?:END_)?IMESSAGE_DRAFT>>>/g;
-const HELPER_TIMEOUT_MS = 6_000;
+const HELPER_TIMEOUT_MS = 25_000;
 
 export type IMessageDraftStatus =
   | "placed"
@@ -79,8 +79,9 @@ export async function placeIMessageDraft(
   proc.stdin?.write(body);
   await proc.stdin?.end();
 
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    setTimeout(() => {
+    timeoutId = setTimeout(() => {
       try {
         proc.kill("SIGKILL");
       } catch {
@@ -98,6 +99,7 @@ export async function placeIMessageDraft(
       ]),
       timeout,
     ]);
+    if (timeoutId) clearTimeout(timeoutId);
 
     if (code !== 0) {
       return {
@@ -107,6 +109,7 @@ export async function placeIMessageDraft(
     }
     return { ok: true };
   } catch (err) {
+    if (timeoutId) clearTimeout(timeoutId);
     return {
       ok: false,
       error: err instanceof Error ? err.message : String(err),
