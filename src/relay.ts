@@ -449,6 +449,7 @@ interface PostClaudeResult {
   memoryTagsStripped: number;
   wrapperTagsStripped: number;
   scaffoldingTagsStripped: number;
+  turnMarkersStripped: number;
   proseDashesStripped: number;
 }
 
@@ -479,14 +480,21 @@ async function postProcessClaudeResponse(
     }
   }
 
+  if (cleanResult.turnMarkersStripped > 0) {
+    console.log(
+      `[turn-marker-strip] removed leaked User:/Assistant: turn marker from response`,
+    );
+  }
+
   const strippedTotal =
     cleanResult.memoryTagsStripped +
     cleanResult.wrapperTagsStripped +
     cleanResult.scaffoldingTagsStripped +
+    cleanResult.turnMarkersStripped +
     cleanResult.proseDashesStripped;
   if (strippedTotal > 0) {
     console.log(
-      `[response-sanitize] memory=${cleanResult.memoryTagsStripped} wrapper=${cleanResult.wrapperTagsStripped} scaffolding=${cleanResult.scaffoldingTagsStripped} prose_dashes=${cleanResult.proseDashesStripped}`,
+      `[response-sanitize] memory=${cleanResult.memoryTagsStripped} wrapper=${cleanResult.wrapperTagsStripped} scaffolding=${cleanResult.scaffoldingTagsStripped} turn=${cleanResult.turnMarkersStripped} prose_dashes=${cleanResult.proseDashesStripped}`,
     );
   }
 
@@ -495,6 +503,7 @@ async function postProcessClaudeResponse(
     memoryTagsStripped: cleanResult.memoryTagsStripped,
     wrapperTagsStripped: cleanResult.wrapperTagsStripped,
     scaffoldingTagsStripped: cleanResult.scaffoldingTagsStripped,
+    turnMarkersStripped: cleanResult.turnMarkersStripped,
     proseDashesStripped: cleanResult.proseDashesStripped,
   };
 }
@@ -571,6 +580,7 @@ bot.on("message:text", async (ctx) => {
     let memoryTagsStripped = 0;
     let wrapperTagsStripped = 0;
     let scaffoldingTagsStripped = 0;
+    let turnMarkersStripped = 0;
     let proseDashesStripped = 0;
     let errorMsg: string | undefined;
     const deterministicTextbookResponse = buildSkippedTextbookResponse(text, ftsHits, {
@@ -593,6 +603,7 @@ bot.on("message:text", async (ctx) => {
         memoryTagsStripped = processed.memoryTagsStripped;
         wrapperTagsStripped = processed.wrapperTagsStripped;
         scaffoldingTagsStripped = processed.scaffoldingTagsStripped;
+        turnMarkersStripped = processed.turnMarkersStripped;
         proseDashesStripped = processed.proseDashesStripped;
       } catch (err) {
         errorMsg = err instanceof Error ? err.message : String(err);
@@ -636,6 +647,7 @@ bot.on("message:text", async (ctx) => {
       memory_tags_stripped: memoryTagsStripped,
       wrapper_tags_stripped: wrapperTagsStripped,
       scaffolding_tags_stripped: scaffoldingTagsStripped,
+      turn_markers_stripped: turnMarkersStripped,
       prose_dashes_stripped: proseDashesStripped,
       response_chars: assistantText.length,
       catalog_response_used: Boolean(deterministicCatalogResponse),
@@ -659,6 +671,7 @@ bot.on("message:voice", async (ctx) => {
   let memoryTagsStripped = 0;
   let wrapperTagsStripped = 0;
   let scaffoldingTagsStripped = 0;
+  let turnMarkersStripped = 0;
   let proseDashesStripped = 0;
   try {
     await ctx.replyWithChatAction("typing");
@@ -708,6 +721,7 @@ bot.on("message:voice", async (ctx) => {
     memoryTagsStripped = processed.memoryTagsStripped;
     wrapperTagsStripped = processed.wrapperTagsStripped;
     scaffoldingTagsStripped = processed.scaffoldingTagsStripped;
+    turnMarkersStripped = processed.turnMarkersStripped;
     proseDashesStripped = processed.proseDashesStripped;
 
     await saveMessage("assistant", assistantText);
@@ -735,6 +749,7 @@ bot.on("message:voice", async (ctx) => {
       memory_tags_stripped: memoryTagsStripped,
       wrapper_tags_stripped: wrapperTagsStripped,
       scaffolding_tags_stripped: scaffoldingTagsStripped,
+      turn_markers_stripped: turnMarkersStripped,
       prose_dashes_stripped: proseDashesStripped,
       response_chars: assistantText.length,
     }).catch(() => undefined);
@@ -754,6 +769,7 @@ bot.on("message:photo", async (ctx) => {
   let memoryTagsStripped = 0;
   let wrapperTagsStripped = 0;
   let scaffoldingTagsStripped = 0;
+  let turnMarkersStripped = 0;
   let proseDashesStripped = 0;
   try {
     await ctx.replyWithChatAction("typing");
@@ -794,6 +810,7 @@ bot.on("message:photo", async (ctx) => {
     memoryTagsStripped = processed.memoryTagsStripped;
     wrapperTagsStripped = processed.wrapperTagsStripped;
     scaffoldingTagsStripped = processed.scaffoldingTagsStripped;
+    turnMarkersStripped = processed.turnMarkersStripped;
     proseDashesStripped = processed.proseDashesStripped;
     await saveMessage("assistant", assistantText);
     await sendResponse(ctx, assistantText);
@@ -817,6 +834,7 @@ bot.on("message:photo", async (ctx) => {
       memory_tags_stripped: memoryTagsStripped,
       wrapper_tags_stripped: wrapperTagsStripped,
       scaffolding_tags_stripped: scaffoldingTagsStripped,
+      turn_markers_stripped: turnMarkersStripped,
       prose_dashes_stripped: proseDashesStripped,
       response_chars: assistantText.length,
     }).catch(() => undefined);
@@ -837,6 +855,7 @@ bot.on("message:document", async (ctx) => {
   let memoryTagsStripped = 0;
   let wrapperTagsStripped = 0;
   let scaffoldingTagsStripped = 0;
+  let turnMarkersStripped = 0;
   let proseDashesStripped = 0;
   try {
     await ctx.replyWithChatAction("typing");
@@ -871,6 +890,7 @@ bot.on("message:document", async (ctx) => {
     memoryTagsStripped = processed.memoryTagsStripped;
     wrapperTagsStripped = processed.wrapperTagsStripped;
     scaffoldingTagsStripped = processed.scaffoldingTagsStripped;
+    turnMarkersStripped = processed.turnMarkersStripped;
     proseDashesStripped = processed.proseDashesStripped;
     await saveMessage("assistant", assistantText);
     await sendResponse(ctx, assistantText);
@@ -894,6 +914,7 @@ bot.on("message:document", async (ctx) => {
       memory_tags_stripped: memoryTagsStripped,
       wrapper_tags_stripped: wrapperTagsStripped,
       scaffolding_tags_stripped: scaffoldingTagsStripped,
+      turn_markers_stripped: turnMarkersStripped,
       prose_dashes_stripped: proseDashesStripped,
       response_chars: assistantText.length,
     }).catch(() => undefined);

@@ -87,11 +87,25 @@ export function stripScaffoldingTags(text: string): { clean: string; stripped: n
   return { clean, stripped };
 }
 
+// Live failure 2026-05-11T13:06:24Z: the bot drafted an iMessage to Peggy
+// correctly, then appended a literal `User: Okay, please draft an email to
+// myself ...` block to its reply. The relay's prompt template ends with
+// `\nUser: ${userMessage}` so Claude was trained on this dialogue format and
+// occasionally pre-emits the next User: turn at the end of its own response.
+// Cut everything from the first leaked turn marker onward.
+export function stripTurnMarkers(text: string): { clean: string; stripped: number } {
+  const re = /\r?\n(?:User|Assistant):\s+\S/;
+  const idx = text.search(re);
+  if (idx < 0) return { clean: text, stripped: 0 };
+  return { clean: text.slice(0, idx).replace(/\s+$/, ""), stripped: 1 };
+}
+
 export interface SanitizedClaudeResponse {
   clean: string;
   memoryTagsStripped: number;
   wrapperTagsStripped: number;
   scaffoldingTagsStripped: number;
+  turnMarkersStripped: number;
   proseDashesStripped: number;
 }
 
@@ -99,13 +113,15 @@ export function sanitizeClaudeResponse(text: string): SanitizedClaudeResponse {
   const memResult = stripMemoryTags(text);
   const wrapResult = stripWrapperTags(memResult.clean);
   const scaffoldResult = stripScaffoldingTags(wrapResult.clean);
-  const dashResult = stripProseDashes(scaffoldResult.clean);
+  const turnResult = stripTurnMarkers(scaffoldResult.clean);
+  const dashResult = stripProseDashes(turnResult.clean);
 
   return {
     clean: dashResult.clean,
     memoryTagsStripped: memResult.stripped,
     wrapperTagsStripped: wrapResult.stripped,
     scaffoldingTagsStripped: scaffoldResult.stripped,
+    turnMarkersStripped: turnResult.stripped,
     proseDashesStripped: dashResult.stripped,
   };
 }

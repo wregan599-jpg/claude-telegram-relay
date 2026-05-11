@@ -4,6 +4,7 @@ import {
   stripMemoryTags,
   stripProseDashes,
   stripScaffoldingTags,
+  stripTurnMarkers,
   stripWrapperTags,
 } from "./response-sanitize";
 
@@ -104,6 +105,43 @@ test("strips orphan opening scaffolding tag", () => {
   const r = stripScaffoldingTags("real content <system-reminder>");
   expect(r.clean).toBe("real content");
   expect(r.stripped).toBe(1);
+});
+
+// Live failure 2026-05-11T13:06:24Z: the bot's reply to an iMessage-draft
+// request ended with a literal `\nUser: Okay, please draft an email to myself ...`
+// turn marker. Claude pre-emits these because the relay's prompt template
+// uses `User: <text>` to terminate every prompt.
+test("cuts response at the first leaked User: turn marker", () => {
+  const leaked = "Draft for the iMessage box:\nHey Peggy ...\n\nUser: Okay, please draft an email to myself";
+  const r = stripTurnMarkers(leaked);
+  expect(r.clean).toBe("Draft for the iMessage box:\nHey Peggy ...");
+  expect(r.stripped).toBe(1);
+});
+
+test("cuts response at the first leaked Assistant: turn marker", () => {
+  const r = stripTurnMarkers("Real reply text.\nAssistant: hallucinated reply");
+  expect(r.clean).toBe("Real reply text.");
+  expect(r.stripped).toBe(1);
+});
+
+test("leaves a clean response untouched when no turn marker leaks", () => {
+  const r = stripTurnMarkers("Normal reply with no marker.");
+  expect(r.clean).toBe("Normal reply with no marker.");
+  expect(r.stripped).toBe(0);
+});
+
+test("does not strip inline mentions of User: inside a sentence", () => {
+  // No newline before "User:" so this is conversational use, not a leak.
+  const r = stripTurnMarkers("Telegram shows it as User: Hi when you send it.");
+  expect(r.clean).toBe("Telegram shows it as User: Hi when you send it.");
+  expect(r.stripped).toBe(0);
+});
+
+test("sanitizeClaudeResponse strips turn markers and reports the count", () => {
+  const leaked = "Draft text here.\n\nUser: leaked next message";
+  const r = sanitizeClaudeResponse(leaked);
+  expect(r.clean).toBe("Draft text here.");
+  expect(r.turnMarkersStripped).toBe(1);
 });
 
 test("sanitizeClaudeResponse strips scaffolding and reports the count", () => {
