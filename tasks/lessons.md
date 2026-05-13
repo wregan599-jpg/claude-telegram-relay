@@ -502,3 +502,534 @@
 - Five-minute Claude calls are too expensive for Telegram chat failures. Make
   `CLAUDE_TIMEOUT_MS` configurable and default it to 90 seconds; longer
   workflows should be explicit, not the default chat path.
+
+## 2026-05-11 — iMessage draft placement, contact resolution, and policy footers
+
+- The relay is the sole source of truth for placement status. `replaceDraftBlock`
+  only swaps text BETWEEN the marker pair, so any trailing line Claude emits
+  after the close marker leaks through to Telegram and contradicts the relay's
+  real status (e.g. Claude says "Draft is in the Messages compose box for X"
+  while the relay says "no thread found for X"). Use `rebuildAroundDraftBlock`
+  in every placement code path — it keeps Claude's lead, scrubs placement-claim
+  phrasing from it, and discards everything after the close marker.
+- macOS keeps the user's "Me" record in
+  `~/Library/Application Support/AddressBook/AddressBook-v22.abcddb` but their
+  real contacts live in iCloud/Exchange source DBs under `Sources/<UUID>/`. On
+  William's Mac the top-level DB has 4 records; the three source DBs have
+  ~17,000 combined. Any contact resolver that queries only the top-level DB
+  will find nothing real. Always glob `Sources/*/AddressBook-v22.abcddb`.
+- Exact-substring contact matching breaks on the most common case: a typo.
+  "gailene" doesn't contain "gaileen". Use `difflib.SequenceMatcher` with a
+  0.75 ratio cutoff against name tokens (first, last, nick). It catches
+  gailene→Gaileen (0.857) and galene→Gaileen (0.83) without false-positiving
+  against unrelated short names. Keep the relationship-alias block list
+  (mom/dad/etc.) in lockstep across the Python resolver and the bash fallback.
+- Draft-intent regexes must include "respond" and "reply", not just
+  "draft/write/compose/send/shoot/text/message". "Respond to Conor saying hope
+  all is well" is the most natural way to ask for a reply; missing it forces
+  Claude through the generic chat path where it appends policy boilerplate
+  instead of placing a draft. Guard against hijacking email intent by skipping
+  when EMAIL_TYPE_RE matches.
+- Never tell Claude to end drafts with "Draft above, review and send manually"
+  or any policy footer. The user reads it as nagging. Hard rule in the system
+  prompt PLUS a line-anchored strip regex (`stripPlacementClaims`) applied to
+  every Claude response BEFORE placement logic. Apply order matters: the strip
+  must run before the relay appends its own status line. As of Gate 2B, relay
+  status lines avoid "review/send" wording too.
+- For UI features that depend on background macOS apps (Messages.app), the
+  fast verification loop is: run the helper from the shell with redacted args
+  (`./scripts/imessage-thread.sh "gailene" 3 | python3 -c "print counts"`),
+  then ship and let the user verify the actual compose box. Don't open
+  Messages.app from automated tests — it disrupts the user's UI.
+- Boilerplate-stripping regexes need a safety guard: if applying every pattern
+  would empty the response entirely, return the original. 2026-05-11 a
+  too-broad "you... to send" pattern matched ordinary helpful text and the
+  user got "I'm sorry, I generated an empty response" instead of a useful
+  reply. Worst case after the guard is one boilerplate line — better than no
+  reply. Also: every alternation in a line-anchored regex should require a
+  SPECIFIC tell (manually/yourself/from messages/the draft) so an alternative
+  branch can never match a generic body line.
+
+## 2026-05-12 — Vault-first memory layer (Obsidian integration)
+
+- Symlink direction matters for Syncthing. Memory files must live in the vault
+  as real Markdown; the native Claude Code memory directory must be the
+  symlink. The opposite direction (vault as symlink to native) means Syncthing
+  may replicate the symlink itself instead of the targets, breaking
+  cross-machine memory access.
+- One idempotent Python reconciler + multiple triggers (SessionStart hook,
+  5-minute launchd, manual) beats six independent automations. One log, one
+  lock, one schema migration. Plugins (Templater, QuickAdd, Linter, Dataview)
+  are for human UX speed only; Python/launchd own correctness so memory
+  integrity works when Obsidian is closed.
+- "Never overwrite existing frontmatter" must include the YAML-parse-failure
+  case. If frontmatter is unparseable, SKIP the file entirely — don't fall
+  through to "fill all defaults" which would clobber the broken-but-recoverable
+  original. Logged WARN with file path is enough; user can fix manually.
+- Obsidian-side linters may nest top-level frontmatter keys under `metadata:`.
+  The reconciler must detect this and MIGRATE the misplaced keys back to
+  top-level (per canonical schema) before applying the "fill missing"
+  defaults — otherwise you get duplicated keys with empty defaults at top
+  level while the real values stay nested.
+- launchd has a restricted PATH and HOME may be empty. Python scripts run
+  from launchd must use the absolute shebang path (`#!/usr/local/bin/python3`
+  rather than `#!/usr/bin/env python3`) when they depend on third-party
+  packages installed in a specific Python interpreter — `/usr/bin/python3`
+  is Apple's stub and won't have PyYAML or anything else.
+- The full reconciler implementation, including the canonical schema, tag
+  taxonomy, and operations breakdown, is captured cross-project at
+  `~/ObsidianVault/02-Cross-Project/vault-first-memory-architecture.md`.
+- `sendResponse` and the persistence calls (`saveMessage`, `appendTurn`) must
+  use the SAME final text. 2026-05-11 the Conor turn persisted an empty string
+  to the short-term turn buffer while `sendResponse` substituted the "empty
+  response" apology — Telegram and the state file disagreed about what the
+  user actually saw. Compute the sendable text once with `ensureSendableResponse`
+  before all three calls.
+- Relationship-alias resolvers must allow EXACT name matches even for blocked
+  fuzzy aliases. 2026-05-11 the new Python resolver blocked "mom" entirely
+  → the user couldn't address his actual mother (who is in iCloud as a contact
+  named "Mom"). Fix: only block fuzzy/substring matches for relationship
+  words; allow exact equality with a contact's first name/nickname/full name.
+  Additionally, hard-skip the user's own "Me" record across exact/substring/
+  fuzzy paths so a stray "mom" → self never happens again. Self-record
+  detection is heuristic — also dedupe by chosen identifier so an alternate
+  match path can't bypass the "Me" filter.
+- Deterministic project-anchor retrieval covers the "semantic search" gap
+  cheaply. 2026-05-11 a long speech-rewrite turn referenced Mark Saint Amman,
+  Rob Roy, MIET, lawyers — names that all exist in the Obsidian Medicolegal-
+  Case binder, but the generic FTS query builder didn't anchor on them
+  because they were buried in a long pasted block. A per-project JSON config
+  (anchors + path prefixes) plus a scoped FTS query injects the right notes
+  whenever the user message hits any anchor. Word-boundary, case-insensitive
+  regex matching keeps false positives down. Skip embeddings until anchors
+  are demonstrably insufficient.
+
+## 2026-05-12 — Obsidian automation audit fixes
+
+- A frontmatter reconciler must distinguish "no frontmatter" from "bad
+  frontmatter." No frontmatter is safe to initialize; malformed frontmatter
+  must be skipped with a warning so the existing note is not clobbered.
+- SessionStart hooks must derive project identity from the git toplevel, not
+  the raw current directory. Claude Code can start inside `src/` or another
+  subfolder; using raw `cwd` makes the sanitized path miss `project-map.yaml`
+  and silently skips the memory symlink check.
+- Scalar YAML fields must be wrapped as one-item lists, never passed through
+  `list(value)`. `tags: cross-project-candidate` should become
+  `[cross-project-candidate]`, not a list of characters.
+- launchd should call the exact working Python interpreter in
+  `ProgramArguments` when a script imports third-party packages. The terminal
+  hook and launchd do not share the same PATH, so `env python3` can pass
+  manually and fail every five minutes under launchd.
+
+## 2026-05-12 — Background memory capture from Telegram turns (v1)
+
+- Wired a deterministic, dependency-free memory-capture module
+  (`src/memory-capture.ts`) into the text handler. Synchronous classification
+  runs after `sendResponse` + `appendTurn`; the file write is fire-and-forget
+  so a slow disk or vault hiccup cannot affect Telegram reply latency. Capture
+  failures log and are swallowed so they never propagate into the per-chat
+  queue.
+- Two destination lanes per the handoff: `01-Projects/<project>/memory/` for
+  high-confidence project-anchored captures, `00-Inbox/_pending-memories/` for
+  ambiguous ones. The reconciler skips pending entirely (intentional) and
+  decays it at 14 days; project-memory writes show up in the next MOC rebuild
+  with no normalization needed (frontmatter ships canonical).
+- Classifier is regex-only, no LLM, no embeddings. Three trigger families:
+  feedback-trigger (`from now on`, `going forward`, `don't ... again`,
+  `that was wrong`, `lesson learned`), fact-trigger (`remember that/this`,
+  `please remember`, `remember <person> is`, `make a note`, `save this`),
+  retrieval-feedback (`keep searching`, `that's not it`, `i meant`,
+  `wrong <thing>`, `try X instead`). Hard suppressors: `don't remember/save`,
+  `remember to ...` (TODO not memory), and any draft-shaped user message.
+- Project inference is layered: `anchoredProjects[0]` if the project-anchor
+  retrieval fired; else `claude-telegram-relay` when the user references the
+  bot/relay/Telegram-replies/draft-above; else relay as the default for
+  behavioral feedback; else `null` → pending lane. Retrieval feedback with no
+  anchor is skipped — "keep searching" with no project context is too noisy.
+- Atomic writes must use a no-overwrite final step, not plain POSIX
+  `rename`. `rename` can replace the target if two captures race on the same
+  slug. Write/fsync a temp file in the destination directory, hard-link it to
+  the target so `EEXIST` preserves the existing note, then remove the temp
+  file. Dedupe by `(kind, slug)` regardless of filename timestamp prefix on
+  the pending side; if an existing file has identical body content the call
+  returns `duplicate_skipped`, otherwise `exists_no_overwrite` (never
+  clobber). The body hash strips frontmatter so date drift doesn't defeat
+  dedupe.
+- Never let memory capture create a new `01-Projects/<project>/` folder from
+  classifier/config output. Validate the project path segment and require the
+  project memory directory to exist; route missing projects to pending review
+  instead. This keeps typoed anchors and future config mistakes from becoming
+  durable vault structure.
+- Ambiguous personal facts should not fall into `claude-telegram-relay` just
+  because the relay captured them. Prefer an existing personal catch-all
+  project (`williamregan-home`, then `williamregan-Projects`) and reserve the
+  relay project for bot behavior, retrieval, iMessage, and implementation
+  feedback. Otherwise "Peggy is the cleaner" pollutes the relay's own memory
+  instead of William's personal memory.
+- Do not leave synthetic verification memories in the real vault. If a test
+  writes through the production module to prove the reconciler path, remove
+  the artifact and rebuild the MOC before handing off; otherwise "Captured
+  from Telegram" becomes false provenance.
+- YAML emission is hand-written (no `js-yaml` dep). Aliases/tags are flow
+  lists with quoted scalars (`tags: ["a", "b"]`) so single-string inputs
+  cannot collapse to `tags: a` and accidentally serialize as a character
+  list. The reconciler's `_represent_list` would do the same, but a v1 round
+  trip must not depend on the reconciler.
+- Decision-log JSONL gained six optional fields:
+  `memory_capture_attempted`, `memory_capture_reason`,
+  `memory_capture_confidence`, `memory_capture_kind`,
+  `memory_capture_destination`, `memory_capture_project`. The classifier
+  result is captured synchronously so these fields are accurate even when the
+  background write is still in flight. The write result lands on stderr/stdout
+  (`[memory-capture] <reason> kind=... dest=... path=...`).
+- Tests isolate via `MEMORY_CAPTURE_VAULT=<tmpdir>` set before the module is
+  imported. The module reads the env lazily so tests can override it without
+  racing import order. End-to-end round trip writes into the tmp vault and is
+  cleaned up in `afterAll`. 18 new tests covering all 8 cases from the
+  handoff plus orchestrator round-trip; full `bun test` is green at 112/112.
+- v1 scope: text handler only. Voice/image/document turns are typically
+  drafting or analysis — they could be wired the same way later if a real use
+  case appears, but speculative coverage is out of scope. Suppression and
+  draft-detection are conservative enough that wiring those handlers would be
+  mechanical: same classify call, fire-and-forget write.
+
+## 2026-05-12 — Drop the pending-inbox lane from the classifier (best-guess routing)
+
+- User feedback after v1 shipped: they will not review an inbox folder, so the
+  classifier must always pick a project. Pending-lane routing inside
+  `classifyMemoryCandidate` was eliminated; the writer keeps the
+  `project_missing_routed_pending` guard as a safety net for typoed/missing
+  project directories (defense in depth, not the normal path).
+- New project-inference order: `anchoredProjects[0]` → relay self-reference →
+  feedback-trigger default to relay → token scan over existing
+  `01-Projects/*` folder names (≥ 6-char tokens, longest match wins) →
+  env-configurable fallback (`MEMORY_CAPTURE_FALLBACK_PROJECT`, default
+  `claude-telegram-relay`). `MemoryCaptureInput` gained an optional
+  `availableProjects` field so tests can control routing without touching the
+  vault; production reads `01-Projects/*` lazily and caches by vault root.
+- "Token scan" is conservative: project name split on `[-_\s.]+`, only tokens
+  ≥ 6 chars are eligible, longest-token match wins. "Medicolegal" matches
+  `Medicolegal-Case`; "telegram" matches `claude-telegram-relay`; short
+  acronyms like "MIET" or "WDMD" fall through to the anchor config or
+  fallback. Generic 4-5 char words (case, app, stack) never trigger routing.
+- Retrieval-feedback with no project anchor remains a hard skip. The user
+  said no inbox, not "capture more aggressively" — a bare "keep searching"
+  with no context cannot be honestly routed and would just clutter the
+  fallback project. Drop it on the floor.
+- Confidence semantics shifted: fallback-routed notes are `medium`,
+  everything with a real signal (anchor/self-ref/feedback-default/token-scan)
+  is `high`, retrieval-feedback stays `medium`. Token-scanned routing earns
+  `high` because a distinctive ≥ 6-char project name appearing as a whole
+  word in the user text is a strong signal, even though the writer never
+  consulted the anchor config.
+- Tag taxonomy: fallback-routed notes get `status/needs-routing` so they're
+  easy to grep/filter inside the catch-all project. The reconciler doesn't
+  rewrite this tag, so it stays as a manual review affordance without
+  reviving the inbox lane.
+- Test additions: token scan via explicit `availableProjects`, env override
+  of fallback project, and the orchestrator test that previously asserted
+  pending-lane behavior now asserts the file lands in the relay project
+  memory dir. Suite at 116/116.
+
+## 2026-05-12 — Contact-regex /i flag let lowercase filler match as a proper noun
+
+- Live failure 2026-05-12T17:52:35Z: "Nono it needs to be in my iMessages
+  compose box on my phone!" was routed through the iMessage draft pipeline
+  with `imessage_context_contact="be in my"`. The relay prefetched context
+  for a non-existent contact and then asked Claude for a marker block;
+  Claude (correctly) refused, leading to `imessage_draft_status:
+  "markers_missing"` and an 851-char paragraph reply that violated the
+  "concise, scannable" rule.
+- Root cause: the contact regex in `extractIMessageDraftRequest` used a
+  trailing `/i` flag. The proper-noun branch `[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}`
+  was meant to require real capitalization, but `/i` makes character classes
+  case-insensitive, so `[A-Z]` also matched lowercase. The phrase "to be in
+  my" satisfied the three-word proper-noun shape with all-lowercase letters.
+- Fix: drop the global `/i`. Prefix keyword stays case-insensitive via
+  `[Ww]ith` / `[Tt]o`. Email branch keeps case-insensitivity via explicit
+  `[A-Za-z]` ranges. Proper-noun branch is now genuinely case-sensitive,
+  matching the way human-written contact names actually look.
+- Regression coverage: the exact live phrasing plus four similar
+  lowercase-filler probes (`to my phone`, `to me`, `to her phone`, etc.)
+  all assert `extractIMessageDraftRequest` returns `null`. Suite at 119/119.
+- Related but not in this fix: the user's underlying complaint ("I want
+  drafts in my iMessages compose box on my phone") is the open Option B
+  work in `project_imessage_phone_access_path.md` — file-based drafts at
+  `~/Library/Messages/Drafts/<chat_identifier>/composition.plist`. Option A
+  (Messages-in-iCloud + lock-screen) was chosen on 2026-05-11 but evidently
+  hasn't delivered the phone-side experience yet. That's a separate
+  workstream from this regex bugfix.
+
+## 2026-05-13 — Past-draft references must not trigger new-draft detection
+
+- Live failure 2026-05-13T00:14:47Z (decisions-2026-05-13.jsonl): user
+  asked "In your draft to Peggy did not not ready through her previous
+  text messages for context?" — a meta-question about a prior draft.
+  Relay parsed it as a new draft request because all three components
+  fired: `draft` (DRAFT_VERB_RE), `messages` (MESSAGE_TYPE_RE), `to Peggy`
+  (contact regex with capitalized name). Relay prefetched 10 Peggy
+  messages (resource waste, prompt bloat) and appended the
+  `markers_missing` footer to Claude's correct meta-answer.
+- Root cause: `hasDraftVerbAndType` had no notion of past-tense /
+  meta-reference to a prior draft. The phrase "your draft to X" is
+  syntactically indistinguishable from "draft a message to X" if you
+  only check for the presence of (verb, type, contact).
+- Fix: new `PAST_DRAFT_REFERENCE_RE` gate runs BEFORE the implicit-verb
+  and verb+type checks in `hasDraftVerbAndType`. Pattern requires a
+  possessive determiner (your/the/that/this/my/our/his/her/their/
+  last/previous/previously/earlier/prior) + a draft-noun (draft/message/
+  reply/response/text/imessage/sms/email/note) + a recipient indicator
+  (to/for/with/about). The recipient-indicator tail is non-negotiable —
+  without it, "directly in the iMessage box" matches and breaks
+  legitimate imperative draft requests (live regression caught in
+  iteration: the existing "Go through my last 5-10 text messages with
+  Peggy ... directly in the iMessage box" test failed because my first
+  draft of the regex matched "in the iMessage" without a tail).
+- Two-step regex (PAST + POSSESSIVE) collapses to one because the
+  POSSESSIVE shape strictly contains the PAST shape minus an optional
+  preposition prefix; the prefix is irrelevant once the (det)(noun)(tail)
+  triple is present.
+- Tests: live failure phrasing + four nearby variants ("Your reply to
+  Conor seemed off", "Did you read context before your draft to Sarah?",
+  "Regarding the text to Mom earlier", "On your previous draft to
+  William") all return null; three imperative shapes ("Draft an iMessage
+  to Peggy saying thanks", "Respond to Conor saying hope all is well",
+  "Please send a message to William saying hey") still trigger. Full
+  suite 122/122.
+- Operational note: when a regex layered fix conflicts with an existing
+  legitimate test, that test is the cheaper truth signal. Iteration
+  in this loop went: first regex → test #1 fails → tighten with tail →
+  all 17 pass. Don't change the existing test; tighten the new regex.
+
+## 2026-05-12 — Gate-1 iMessage draft writer safety
+
+- While preparing the temporary `composition.plist` writer for the
+  phone-visibility Gate 1 test, the inlined handoff script had a safety gap:
+  if an existing draft file was present but unparseable, `existing_body_chars`
+  returned `None`, which the writer treated the same as "no file exists".
+  That could overwrite a real user draft without a backup.
+- Fix in `/tmp/icloud-draft-write-test.py`: an existing-but-unparseable
+  draft now returns `existing_draft_unparseable` unless `--force` is used.
+  With `--force`, the current file is moved to
+  `composition.plist.bak-<unix-ts>` before writing. This matches the hard
+  rule: never clobber user draft state silently.
+- Verification: the temporary writer syntax-checks with
+  `/usr/local/bin/python3 -m py_compile`; a missing target returns
+  `target_dir_missing`; both `+17809346164` and today's active
+  `+15196816391` draft refuse without `--force` and report only body
+  character counts, not plaintext.
+
+## 2026-05-13 — Gate 2B iPhone draft handoff
+
+- Gate 1 result was negative: direct `~/Library/Messages/Drafts/<chat_id>/composition.plist`
+  writes can be picked up by Mac Messages.app, but file-based draft state did
+  not propagate to the iPhone compose box. Do not keep iterating on
+  `composition.plist` as the phone-delivery path.
+- Gate 2B v1 uses the Shortcuts iCloud container as the handoff surface:
+  `~/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/claude-relay-drafts/latest.json`.
+  The file contains the current plaintext draft because the iPhone Shortcut
+  needs to read it, but decision logs store only the path, Shortcut URL, and
+  SHA-256 hash.
+- The relay now prefers the Shortcuts iCloud handoff when an iMessage recipient is
+  resolved, and falls back to the existing Mac compose helper only if the
+  handoff write fails or no recipient is resolved. The Mac helper remains
+  important as a local fallback; do not remove it.
+- The handoff writer must convert every filesystem failure after root
+  detection (mkdir/open/write/fsync/chmod/rename) into `{ ok: false }`, not
+  throw. The relay depends on that contract to fall back to the Mac compose
+  helper instead of failing the whole Telegram reply.
+- The storage selector in Shortcuts is load-bearing. The working shortcut
+  reads "Get File from Shortcuts at path claude-relay-drafts/latest.json",
+  which maps to `iCloud~is~workflow~my~workflows/Documents` on macOS. Writing
+  the general `com~apple~CloudDocs/claude-relay-drafts/latest.json` path is a
+  different file and will not feed the Shortcut unless the Shortcut is also
+  pointed at general iCloud Drive.
+- 2026-05-13 audit: the terminal's successful Mac Shortcut run only worked
+  after copying `latest.json` into the Shortcuts container. That proved the
+  relay default was wrong, not that the Shortcut should be repointed. Fix the
+  writer to match the working Shortcut storage selector.
+- User-facing placement copy must avoid the banned "review and send" /
+  "send manually" footer family. The phone handoff status is:
+  `Phone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft`.
+
+## 2026-05-13 - ClaudeDraft Shortcut: manual recipe beats automation
+
+- The macOS `shortcuts` CLI has no `create` subcommand — only `run`, `list`,
+  `view`, `sign`. There is no first-class programmatic path to build a new
+  Shortcut from a script. `shortcuts sign --mode anyone --input <plist>`
+  exists, so a hand-rolled `.shortcut` plist with WFActions array can be
+  imported, but the plist schema for each action (e.g. WFSendMessageShowComposeSheet
+  on `is.workflow.actions.sendmessage`) is not officially documented and the
+  failure mode if you get one field wrong on Send Message is "ships a real
+  send." Do not use this route for any action set that includes Send Message
+  unless you have a known-good fixture to diff against.
+- Shortcuts.app's editor is hostile to System Events. Top-level windows are
+  visible (`name of every window` returns "All Shortcuts" / "New Shortcut" /
+  individual editors), but the action-picker is search-driven and individual
+  action toggles like "Show When Run" sit inside disclosure groups that are
+  not reliably AX-addressable. The prior session's osascript route stalled
+  here even before bypass mode was on — bypass mode does not make the
+  accessibility tree richer.
+- For any Shortcut whose correctness depends on a single toggle that
+  silently flips destructive ("Show When Run" OFF = auto-send), the right
+  call is the 4-step manual recipe handed to the user, not automation. The
+  user builds it in ~2 min; the build-time tap-test on Mac catches the
+  toggle without burning a real iMessage.
+- Verification fixture detail: the `latest.json` present at handoff time
+  was the relay's self-test fixture (`recipient_label: "ClaudeDraft self-test"`,
+  `recipient: wregan599@gmail.com`, `body_sha256: "test"` — the literal
+  string, not a real hash). This is fine for Shortcut build verification —
+  Action 1 just reads whatever is at the path — and the recipient being
+  the user's own email means an accidental Send would arrive at his own
+  inbox. Real relay-written files have a proper SHA-256 in `body_sha256`.
+- Leftover state to clean up at end of build: the prior session created an
+  empty Shortcut literally named "New Shortcut" in the user's Shortcuts
+  library. It is harmless but should be deleted after `ClaudeDraft` is
+  saved, to keep the library tidy.
+
+## 2026-05-13 - ClaudeDraft Shortcut: plist+sign route is viable, supersedes earlier "manual only" claim
+
+- Today's session built and shipped ClaudeDraft end-to-end via the
+  `shortcuts sign --mode anyone` route. Earlier-today entry above was
+  pessimistic about Send Message — concrete schema below makes it tractable.
+- `shortcuts sign --mode anyone --input <file>.shortcut --output <file>.shortcut`
+  works when the input has the `.shortcut` extension (a plain `.plist`
+  extension is rejected with "not in the correct format"). The Obj-C
+  runtime warnings about `T@"NSString",?,R,C` are harmless noise — the
+  signed output still gets written. Use binary plist for the input.
+- Shortcut name on import is the **filename minus extension** — there is
+  no `WFWorkflowName` key in the plist. To name a shortcut `ClaudeDraft`,
+  the file must be `ClaudeDraft.shortcut`.
+- Existing user shortcuts on disk (in `Shortcuts.sqlite`'s `ZSHORTCUTACTIONS`
+  table) are the most reliable schema reference. `Pipewrench` in this
+  user's library happened to be a near-identical pattern (downloadurl →
+  detect.dictionary → getvalueforkey × 3 → sendmessage) and gave the exact
+  Send Message parameter shape:
+  - `is.workflow.actions.sendmessage` parameters:
+    - `IntentAppIdentifier: "com.apple.MobileSMS"`
+    - `IntentAppDefinition: {BundleIdentifier, Name, TeamIdentifier}`
+    - `WFSendMessageActionRecipients` (NOT `WFSendMessageRecipients`)
+    - `WFSendMessageContent`
+    - `ShowWhenRun: True` ← the make-or-break toggle (NOT
+      `WFSendMessageShowComposeSheet` as community references sometimes
+      claim). When `True`, the OS shows the compose sheet instead of
+      auto-sending.
+- Magic-variable chaining for `is.workflow.actions.getvalueforkey`
+  feeding `sendmessage`: assign every action a UUID, reference upstream
+  outputs as
+  `{Value: {OutputUUID, Type: "ActionOutput", OutputName: "<output-name>", Aggrandizements: [{Type: "WFCoercionVariableAggrandizement", CoercionItemClass: "WFStringContentItem"}]}, WFSerializationType: "WFTextTokenAttachment"}`.
+  `OutputName` strings are stable: `"File"` for documentpicker, `"Dictionary"`
+  for detect.dictionary, `"Dictionary Value"` for getvalueforkey, `"Text"` for
+  gettext. Aggrandizement coercion ensures the downstream consumer gets
+  the right type (e.g. recipient as `WFStringContentItem`).
+- Get File action storage selector — important and non-obvious:
+  - With `WFShowFilePicker=False` and no `WFFile` bookmark, just
+    `WFGetFilePath="claude-relay-drafts/latest.json"` resolves to the
+    **Shortcuts iCloud container**
+    (`~/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/`),
+    not the iCloud Drive root. The action displays in the editor as
+    `Get file from Shortcuts at path X`. The word "Shortcuts" there is the
+    Files-app provider, not the app name.
+  - To target iCloud Drive root explicitly you must supply a `WFFile`
+    bookmark dict that survives import:
+    ```
+    WFFile: {
+      fileLocation: {
+        crossDeviceItemID: "docs.icloud.com:com.apple.CloudDocs/<UUID>/<itemID>",
+        fileProviderDomainID: "com.apple.CloudDocs.iCloudDriveFileProvider/<UUID>",
+        relativeSubpath: "com~apple~CloudDocs/claude-relay-drafts/latest.json",
+        WFFileLocationType: "iCloud",
+      },
+      filename: "latest.json", displayName: "latest.json",
+    }
+    ```
+    These UUIDs are device/account-specific; capture them once from a UI
+    edit and embed them. **And** `WFGetFilePath` must be empty/absent when
+    `WFFile` already names a specific file, or runtime errors with "the
+    provided file path must be contained within the directory."
+  - Because the bookmark is device-specific, the simpler design is to write
+    the relay's payload into the Shortcuts container and let the shortcut
+    use its default storage. That's what the relay was changed to do on
+    2026-05-13 (relay code change made in parallel during this build):
+    write to
+    `~/Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/claude-relay-drafts/latest.json`,
+    so the Shortcut's default `WFGetFilePath="claude-relay-drafts/latest.json"`
+    resolves correctly without any custom bookmark.
+- Send Message action triggers a one-time **OS privacy prompt** the first
+  time it runs: "Allow 'ClaudeDraft' to send 1 dictionary in a message?"
+  with Don't Allow / Allow Once / Always Allow. The word "dictionary"
+  refers to the OS tracking the upstream data type, not the actual message
+  payload — the recipient and body are extracted correctly downstream of
+  the Get Value actions. Pick **Allow Once** for one-shot tests so you
+  don't grant permanent dictionary-send permission to the shortcut.
+- UI-automation tactics that worked on macOS 15 today, for future Shortcut
+  edits when bookmark capture is needed:
+  - Mouse click via Quartz `CGEventCreateMouseEvent` is reliable. The
+    Shortcuts editor's action elements (e.g. the storage-location pill
+    on a Get File action) are clickable at the visible text rectangle.
+  - To set a folder/file bookmark in the editor's `NSOpenPanel`: open the
+    panel via clicking the pill, then **Cmd+Shift+G** ("Go to Folder")
+    with the absolute filesystem path, Enter to navigate, Enter to confirm.
+    This commits a bookmark that survives save and re-read from
+    `ZSHORTCUTACTIONS.ZDATA`.
+- Toolchain bootstrap pattern: import a minimal one-action shortcut
+  (`Show Result`) via plist+sign+open and click `Add Shortcut` first to
+  confirm the import flow works on the user's machine before authoring
+  the real shortcut. This caught one early-iteration bug (extension
+  mismatch) without risking the destructive Send Message path.
+- `shortcuts list` / `shortcuts run` / `shortcuts view` are the public CLI.
+  There is no `shortcuts delete` — tombstoning rows via
+  `UPDATE ZSHORTCUT SET ZTOMBSTONED=1 WHERE ZNAME=...` in
+  `~/Library/Shortcuts/Shortcuts.sqlite` removes them from the list.
+  Shortcuts.app's iCloud sync eventually propagates the tombstone.
+- End-of-build verification on Mac: with the relay-written fixture present
+  in the Shortcuts container, `shortcuts run ClaudeDraft` brings up the
+  Messages compose sheet pre-filled with the recipient
+  (`wregan599@gmail.com` in the self-test fixture); Escape or Cancel
+  closes the sheet without sending. Confirmed no row appears in
+  `~/Library/Messages/chat.db` after cancellation.
+- After a Mac-side Shortcut smoke test, check for stale
+  `shortcuts run ClaudeDraft` processes before handoff. The CLI can remain
+  alive while a compose sheet is open or after a UI test stalls; that makes the
+  terminal look stuck even though the relay code is fine. Stop the stale test
+  runner, then verify the relay process and iCloud `latest.json` separately.
+- Self-addressed iMessage drafts need a first-class parser path. "Reply to
+  myself..." and "Reply to me..." do not contain a capitalized contact name,
+  so the normal `to <ProperName>` extractor misses them and the relay falls
+  back to slow generic Claude chat. Route `myself` / `me` to a deterministic
+  self contact and short-circuit context lookup to `RELAY_SELF_RECIPIENT`
+  (fallback: William's Apple-ID email) so the relay writes the phone handoff
+  file without shelling out to Messages history.
+- Keep self-recipient intent stricter than self-recipient extraction. Phrases
+  like "Please send to me instead of the Mac" are UI complaints, not draft
+  requests. Accept strong self-draft shapes (`reply to me`, `text me`, `ping
+  me`, `send me a message`, `draft a message to me`) but do not treat every
+  stray `to me` as a draft.
+- Do not rely only on Telegram inline buttons for `shortcuts://` handoff URLs.
+  Custom-scheme behavior can vary by Telegram/iOS client. Keep the inline
+  "Open draft on iPhone" button, but also leave a visible `shortcuts://...`
+  fallback in the message so the user can copy it if the button does nothing.
+- Exact-body iMessage requests should bypass Claude. If the user says
+  "Reply to myself saying X" or "Text Peggy with X", the body is already known;
+  wrapping it in the draft markers locally avoids a slow Claude call and avoids
+  marker-compliance failures. Reserve Claude for polishing descriptive asks or
+  using fetched thread context. Guard the `with ...` form carefully:
+  "Draft an iMessage with Peggy" means Peggy is the recipient, not the body.
+- Vague placement requests with no exact body and no resolved Messages thread
+  should fail fast with a clarification, not go through Claude and then report
+  `markers_missing`. Example: "draft an iMessage response to Mark directly in
+  the chatbox" has neither a body nor usable thread context when Mark cannot be
+  resolved, so ask for Mark's phone/email plus the message body. Treat `empty`,
+  `timeout`, and `error` lookup statuses the same for this branch; none give
+  the relay a usable body or recipient.
+- Do not run placement-claim stripping across the inside of
+  `<<<IMESSAGE_DRAFT>>>` markers before extracting the body. The stripper is
+  intentionally aggressive against lines like "I can't send it..." and "I have
+  placed the draft...", but those can be legitimate user-supplied body text.
+  The stripper itself now preserves complete marker blocks before removing
+  boilerplate, so future callers cannot corrupt exact draft bodies.
+- Treat retrieval startup preflight as diagnostic, not a permanent feature
+  gate. The SQLite index can transiently lock during launch; if preflight
+  times out and the relay sets `retrievalAvailable=false`, FTS stays disabled
+  until a manual restart even though later searches may work. Keep retrieval
+  enabled after preflight failure and let per-request search handling decide.
