@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import {
   detectIMessageWriteIntent,
   extractIMessageDraftRequest,
+  fetchIMessageContext,
   renderIMessageContext,
   type IMessageContextResult,
 } from "./imessage-context";
@@ -29,6 +30,7 @@ test("plain 'Draft a message to William saying hey wuddup' still triggers placem
     wantsContext: false,
     contextLimit: 10,
     wantsPlacement: true,
+    directBody: "hey wuddup",
   });
 });
 
@@ -40,6 +42,7 @@ test("'iMessage' keyword still works even without explicit placement phrasing", 
     wantsContext: false,
     contextLimit: 10,
     wantsPlacement: true,
+    directBody: "thanks",
   });
 });
 
@@ -53,6 +56,246 @@ test("returns null when there is no contact", () => {
   expect(
     extractIMessageDraftRequest("Draft a message saying hey"),
   ).toBeNull();
+});
+
+test("'Respond to Conor saying hope all is well man' triggers iMessage draft", () => {
+  expect(
+    extractIMessageDraftRequest("Respond to Conor saying hope all is well man"),
+  ).toEqual({
+    contact: "Conor",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "hope all is well man",
+  });
+});
+
+test("'Reply to Sarah' triggers iMessage draft without explicit message keyword", () => {
+  expect(extractIMessageDraftRequest("Reply to Sarah saying I'm in")).toEqual({
+    contact: "Sarah",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "I'm in",
+  });
+});
+
+test("'Respond to John's email' does NOT hijack the email path", () => {
+  expect(
+    extractIMessageDraftRequest("Respond to John's email saying thanks"),
+  ).toBeNull();
+});
+
+test("complaint about placement is not parsed as a draft request (regression 2026-05-12)", () => {
+  // Live failure: "Nono it needs to be in my iMessages compose box on my phone!"
+  // captured "be in my" as a three-word proper noun because the contact regex
+  // had a global /i flag, so [A-Z][a-z]+ also matched lowercase. The relay
+  // then prefetched context for contact="be in my" and ran an iMessage
+  // placement pipeline against a complaint message. Decision log
+  // 2026-05-12T17:52:35Z, imessage_context_contact="be in my".
+  expect(
+    extractIMessageDraftRequest(
+      "Nono it needs to be in my iMessages compose box on my phone!",
+    ),
+  ).toBeNull();
+});
+
+test("past-draft references are not parsed as new draft requests (regression 2026-05-13)", () => {
+  // Live failure 2026-05-13T00:14Z: "In your draft to Peggy did not not ready
+  // through her previous text messages for context?" was treated as a new
+  // draft request to Peggy because "draft" + "messages" + "to Peggy" all
+  // matched. The relay then prefetched 10 messages and appended the
+  // "couldn't place this in Messages this time" footer to a meta-question
+  // about a prior draft. Decision log entry confirms ctx_count=10,
+  // draft_status=markers_missing, response_chars=1136.
+  expect(
+    extractIMessageDraftRequest(
+      "In your draft to Peggy did not not ready through her previous text messages for context?",
+    ),
+  ).toBeNull();
+});
+
+test("possessive-references to prior drafts/messages do not trigger placement", () => {
+  for (const msg of [
+    "About your message to Peggy yesterday, did you include the address?",
+    "Your reply to Conor seemed off — what was that based on?",
+    "Did you read context before your draft to Sarah?",
+    "Regarding the text to Mom earlier, can you clarify?",
+    "On your previous draft to William, what was the tone?",
+  ]) {
+    expect(extractIMessageDraftRequest(msg)).toBeNull();
+  }
+});
+
+test("imperative draft requests still fire after past-reference guard", () => {
+  // Defense against over-suppression: the guard must not block legitimate
+  // imperative draft requests.
+  expect(
+    extractIMessageDraftRequest("Draft an iMessage to Peggy saying thanks"),
+  ).not.toBeNull();
+  expect(
+    extractIMessageDraftRequest("Respond to Conor saying hope all is well"),
+  ).not.toBeNull();
+  expect(
+    extractIMessageDraftRequest("Please send a message to William saying hey"),
+  ).not.toBeNull();
+});
+
+test("lowercase filler phrases after to/with are not parsed as contacts", () => {
+  for (const msg of [
+    "I need it sent to my phone please",
+    "Move the draft to the iMessage box on my phone",
+    "Please send to me instead of the Mac",
+    "Forward it to her phone via iMessage",
+  ]) {
+    expect(extractIMessageDraftRequest(msg)).toBeNull();
+  }
+});
+
+test("'Reply to myself' triggers a self-recipient draft (regression 2026-05-13)", () => {
+  // Live failure 2026-05-13T18:26Z: "Reply to myself saying testing this
+  // relay" returned null from the parser because "myself" is lowercase and
+  // the proper-noun branch requires capitalization. Claude then received
+  // the message as a generic chat with no draft pathway and timed out at
+  // CLAUDE_TIMEOUT_MS=90000ms. The relay never wrote latest.json and the
+  // Telegram reply never contained the `shortcuts://run-shortcut?name=...`
+  // URL, so the iPhone handoff never fired.
+  expect(extractIMessageDraftRequest("Reply to myself saying testing this relay")).toEqual({
+    contact: "myself",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "testing this relay",
+  });
+  expect(extractIMessageDraftRequest("Draft an iMessage to me about the demo")).toEqual({
+    contact: "myself",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+  });
+  expect(extractIMessageDraftRequest("Respond to myself with the test body")).toEqual({
+    contact: "myself",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "the test body",
+  });
+  expect(extractIMessageDraftRequest("Reply to me saying testing this relay")).toEqual({
+    contact: "myself",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "testing this relay",
+  });
+  expect(extractIMessageDraftRequest("Text myself a reminder to check the relay")).toEqual({
+    contact: "myself",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+  });
+  expect(extractIMessageDraftRequest("Text me saying this is a phone handoff test")).toEqual({
+    contact: "myself",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "this is a phone handoff test",
+  });
+  expect(extractIMessageDraftRequest("Ping to me saying this is a phone handoff test")).toEqual({
+    contact: "myself",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "this is a phone handoff test",
+  });
+  expect(extractIMessageDraftRequest("Ping me saying this is a phone handoff test")).toEqual({
+    contact: "myself",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "this is a phone handoff test",
+  });
+  expect(extractIMessageDraftRequest("Send me a message saying this is a phone handoff test")).toEqual({
+    contact: "myself",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "this is a phone handoff test",
+  });
+  expect(extractIMessageDraftRequest("Send myself a message saying this is a phone handoff test")).toEqual({
+    contact: "myself",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "this is a phone handoff test",
+  });
+});
+
+test("direct draft body strips placement-only phrasing", () => {
+  expect(
+    extractIMessageDraftRequest(
+      "Draft an iMessage to Peggy saying hi directly in the iMessage box",
+    ),
+  ).toMatchObject({
+    contact: "Peggy",
+    directBody: "hi",
+  });
+});
+
+test("'with <contact>' is treated as a recipient, not a draft body", () => {
+  expect(
+    extractIMessageDraftRequest("Draft an iMessage with Peggy"),
+  ).toEqual({
+    contact: "Peggy",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+  });
+});
+
+test("vague response requests have no direct body", () => {
+  expect(
+    extractIMessageDraftRequest(
+      "Please draft an iMessage response to Mark directly in the chatbox",
+    ),
+  ).toMatchObject({
+    contact: "Mark",
+    wantsPlacement: true,
+  });
+  expect(
+    extractIMessageDraftRequest(
+      "Please draft an iMessage response to Mark directly in the chatbox",
+    )?.directBody,
+  ).toBeUndefined();
+});
+
+test("self-recipient still respects placement suppression", () => {
+  // "just give me the text" forces wantsPlacement=false even for self drafts.
+  const r = extractIMessageDraftRequest(
+    "Reply to myself in Telegram only saying check",
+  );
+  expect(r?.contact).toBe("myself");
+  expect(r?.wantsPlacement).toBe(false);
+});
+
+test("self-recipient context resolves without shelling out to iMessage lookup", async () => {
+  const original = process.env.RELAY_SELF_RECIPIENT;
+  process.env.RELAY_SELF_RECIPIENT = "self@example.com";
+  try {
+    await expect(
+      fetchIMessageContext("/does/not/matter", { contact: "myself", limit: 10 }),
+    ).resolves.toMatchObject({
+      request: { contact: "myself", limit: 10 },
+      status: "empty",
+      resolvedRecipient: "self@example.com",
+      messages: [],
+    });
+  } finally {
+    if (original === undefined) {
+      delete process.env.RELAY_SELF_RECIPIENT;
+    } else {
+      process.env.RELAY_SELF_RECIPIENT = original;
+    }
+  }
 });
 
 test("suppresses placement when the user asks for Telegram-only output", () => {

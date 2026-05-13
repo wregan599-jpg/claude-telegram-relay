@@ -42,7 +42,14 @@ export interface DecisionRecord {
     | "no_recipient"
     | "helper_failed"
     | "no_intent";
-  imessage_draft_mode?: "pasted" | "clipboard_only";
+  imessage_draft_mode?:
+    | "pasted"
+    | "clipboard_only"
+    | "new_compose"
+    | "icloud_drive_file";
+  imessage_draft_handoff_path?: string;
+  imessage_draft_body_sha256?: string;
+  imessage_draft_shortcut_url?: string;
   memory_tags_stripped?: number;
   wrapper_tags_stripped?: number;
   scaffolding_tags_stripped?: number;
@@ -51,6 +58,16 @@ export interface DecisionRecord {
   response_chars?: number;
   catalog_response_used?: boolean;
   skipped_textbook_response_used?: boolean;
+  // Background memory-capture fields. The classifier runs synchronously after
+  // the user-facing reply is sent; the actual write is fire-and-forget so
+  // memory_capture_wrote / memory_capture_path are best-effort and may be
+  // absent if the write is still in flight when this record is logged.
+  memory_capture_attempted?: boolean;
+  memory_capture_reason?: string;
+  memory_capture_confidence?: "high" | "medium" | "low";
+  memory_capture_kind?: "feedback" | "project" | "user" | "reference" | "bug";
+  memory_capture_destination?: "project-memory" | "pending";
+  memory_capture_project?: string;
 }
 
 function dateUtc(offsetDays = 0): string {

@@ -21,6 +21,11 @@ import {
   getRelevantContext,
 } from "./memory.ts";
 import { search as ftsSearch, renderContext as renderFtsContext, preflight as retrievalPreflight } from "./retrieval.ts";
+import {
+  findAnchoredProjects,
+  retrieveAnchoredContext,
+  renderAnchoredContext,
+} from "./project-anchors.ts";
 import { isReferential } from "./trigger.ts";
 import { buildSearchQuery, countContentTokens, type Turn } from "./query-builder.ts";
 import { loadTurns, appendTurn } from "./short-term.ts";
@@ -34,9 +39,12 @@ import {
 import {
   DRAFT_MARKER_CLOSE,
   DRAFT_MARKER_OPEN,
+  NEW_COMPOSE_SENTINEL,
   extractDraftBody,
   placeIMessageDraft,
+  rebuildAroundDraftBlock,
   replaceDraftBlock,
+  stripPlacementClaims,
   type IMessageDraftStatus,
 } from "./imessage-draft.ts";
 import {
@@ -46,6 +54,11 @@ import {
   markUpdateStarted,
   type DecisionRecord,
 } from "./decision-log.ts";
+import { writeICloudDriveDraft } from "./icloud-drive-draft.ts";
+import {
+  classifyMemoryCandidate,
+  writeMemoryCandidate,
+} from "./memory-capture.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -616,15 +629,48 @@ bot.on("message:text", async (ctx) => {
     const recentBlock = renderRecentTurnsPlain(recentTurns, MAX_RECENT_TURNS_RENDERED, {
       suppressStaleIMessageFailures: Boolean(imessageContextResult),
     });
+    // Project-anchor retrieval: deterministic. If the user message contains
+    // anchors for a known project (e.g. "lawyers / Saint Amman / MIET" →
+    // Medicolegal-Case), pull the top hits from that project's paths and
+    // inject them so Claude has context Saint-Amman-the-supervisor is real,
+    // not invented. See config/project-anchors.json.
+    let projectAnchorBlock = "";
+    let anchoredProjectNames: string[] = [];
+    try {
+      const matches = await findAnchoredProjects(text);
+      anchoredProjectNames = matches.map((m) => m.project.name);
+      if (matches.length > 0) {
+        const anchored = await retrieveAnchoredContext(matches);
+        projectAnchorBlock = renderAnchoredContext(anchored);
+        if (projectAnchorBlock) {
+          console.log(
+            `[project-anchors] injected ${anchored.reduce((n, h) => n + h.chunks.length, 0)} chunk(s) across ${anchored.length} project(s)`,
+          );
+        }
+      }
+    } catch (err) {
+      console.error("[project-anchors] failed:", err instanceof Error ? err.message : err);
+    }
     const [supabaseContext, memoryContext] = supabase
       ? await Promise.all([
           getRelevantContext(supabase, text),
           getMemoryContext(supabase),
         ])
       : ["", ""];
-    const combinedRelevant = [imessageContext, recentBlock, indexedContent, supabaseContext]
+    const combinedRelevant = [imessageContext, recentBlock, projectAnchorBlock, indexedContent, supabaseContext]
       .filter(Boolean)
       .join("\n\n");
+    const directIMessageBody =
+      wantsIMessagePlacement && draftRequest?.directBody && !draftRequest.wantsContext
+        ? draftRequest.directBody
+        : undefined;
+    const shouldClarifyMissingIMessageBody =
+      wantsIMessagePlacement &&
+      Boolean(draftRequest) &&
+      !directIMessageBody &&
+      !draftRequest?.wantsContext &&
+      imessageContextResult?.status !== "found" &&
+      !imessageContextResult.resolvedRecipient;
 
     const enrichedPrompt = capPrompt(
       buildPrompt(text, combinedRelevant, memoryContext, {
@@ -652,6 +698,11 @@ bot.on("message:text", async (ctx) => {
       assistantText = deterministicTextbookResponse;
     } else if (deterministicCatalogResponse) {
       assistantText = deterministicCatalogResponse;
+    } else if (directIMessageBody) {
+      assistantText = `${DRAFT_MARKER_OPEN}\n${directIMessageBody}\n${DRAFT_MARKER_CLOSE}`;
+    } else if (shouldClarifyMissingIMessageBody) {
+      const contactLabel = draftRequest?.contact ?? "that contact";
+      assistantText = `I couldn't find a Messages thread for ${contactLabel}, and I don't have the message body yet. Send me the phone/email plus what you want it to say.`;
     } else {
       try {
         const raw = await callClaude(enrichedPrompt, { resume: true });
@@ -675,11 +726,35 @@ bot.on("message:text", async (ctx) => {
         }
       }
     }
+    // Strip "Draft above, review and send manually" and similar boilerplate
+    // footers Claude likes to append. Hard-banned by 2026-05-11 feedback.
+    // Applied here (before placement logic) so it works for placement AND
+    // non-placement drafts alike. For placement requests, rebuildAroundDraftBlock
+    // already strips claims from the lead and discards anything after the
+    // marker block — this catches the plain-text case where there are no
+    // markers and Claude just appends the boilerplate.
+    const hasDraftMarkerBlock =
+      assistantText.includes(DRAFT_MARKER_OPEN) &&
+      assistantText.includes(DRAFT_MARKER_CLOSE);
+    if (!(wantsIMessagePlacement && hasDraftMarkerBlock)) {
+      assistantText = stripPlacementClaims(assistantText).trim();
+    }
     const claudeMs = Date.now() - tClaude0;
 
     let imessageDraftStatus: IMessageDraftStatus | undefined;
-    let imessageDraftMode: "pasted" | "clipboard_only" | undefined;
-    if (wantsIMessagePlacement) {
+    let imessageDraftMode:
+      | "pasted"
+      | "new_compose"
+      | "clipboard_only"
+      | "icloud_drive_file"
+      | undefined;
+    let imessageDraftHandoffPath: string | undefined;
+    let imessageDraftBodySha256: string | undefined;
+    let imessageDraftShortcutUrl: string | undefined;
+    if (shouldClarifyMissingIMessageBody) {
+      imessageDraftStatus = "no_recipient";
+    }
+    if (wantsIMessagePlacement && !shouldClarifyMissingIMessageBody) {
       const body = extractDraftBody(assistantText);
       const resolved = imessageContextResult?.resolvedRecipient;
       const contactLabel =
@@ -687,54 +762,110 @@ bot.on("message:text", async (ctx) => {
 
       if (!body) {
         imessageDraftStatus = "markers_missing";
-        const stripped = replaceDraftBlock(assistantText, "").trim();
+        // No marker block means Claude ignored the placement instruction. Strip
+        // any orphan markers AND any hallucinated "Draft is placed" lines so
+        // the relay's "couldn't place" message isn't contradicted.
+        const stripped = stripPlacementClaims(
+          replaceDraftBlock(assistantText, ""),
+        ).trim();
         assistantText = stripped.length > 0
-          ? `${stripped}\n\n(I couldn't place this in Messages this time — paste it manually for now.)`
-          : "(I couldn't place this in Messages this time — paste it manually for now.)";
+          ? `${stripped}\n\n(I couldn't place this in Messages this time.)`
+          : "(I couldn't place this in Messages this time.)";
         console.error(
           `[imessage-draft] markers_missing for ${contactLabel}; resp_chars=${assistantText.length}`,
         );
-      } else if (!resolved) {
-        imessageDraftStatus = "no_recipient";
-        const hint = imessageContextResult?.status === "fda_denied"
-          ? "Couldn't open Messages — Full Disk Access is missing. See docs/IMESSAGE-SETUP.md."
-          : `Couldn't open Messages — no thread found for ${contactLabel}. Send the phone or email and I'll place it.`;
-        assistantText = replaceDraftBlock(assistantText, `${body}\n\n${hint}`);
-        console.error(
-          `[imessage-draft] no_recipient for ${contactLabel} (context_status=${imessageContextResult?.status})`,
-        );
       } else {
-        const placement = await placeIMessageDraft(PROJECT_ROOT, resolved, body);
-        if (placement.ok && placement.mode === "pasted") {
-          imessageDraftStatus = "placed";
-          imessageDraftMode = "pasted";
-          assistantText = replaceDraftBlock(
+        // Three real placement paths:
+        //   - resolved → write latest draft to the Shortcuts iCloud container
+        //     for the iPhone Shortcut handoff.
+        //   - resolved + handoff unavailable → place into that contact's
+        //     existing Mac thread.
+        //   - !resolved → open a fresh New Message compose on the Mac with the
+        //     body prefilled and the To: field blank (NEW_COMPOSE_SENTINEL).
+        // FDA-denied is the one case where we cannot place anything at all —
+        // it points to a setup problem the user has to fix first.
+        if (!resolved && imessageContextResult?.status === "fda_denied") {
+          imessageDraftStatus = "no_recipient";
+          const hint = "Couldn't open Messages on your Mac — Full Disk Access is missing. See docs/IMESSAGE-SETUP.md.";
+          assistantText = rebuildAroundDraftBlock(
             assistantText,
-            `${body}\n\nDraft is in the Messages compose box for ${contactLabel}. Review and send when ready.`,
+            `${body}\n\n${hint}`,
           );
-          console.log(
-            `[imessage-draft] pasted into compose for ${contactLabel} (${resolved})`,
-          );
-        } else if (placement.ok) {
-          // clipboard_only fallback — body is on the clipboard, Messages is
-          // open on the right thread, but native URL body prefill failed.
-          // Tell the user the truth instead of claiming compose-box placement.
-          imessageDraftStatus = "placed";
-          imessageDraftMode = "clipboard_only";
-          assistantText = replaceDraftBlock(
-            assistantText,
-            `${body}\n\nDraft is on your clipboard and Messages is open on the thread with ${contactLabel}. Paste with Cmd+V and send when ready.`,
-          );
-          console.log(
-            `[imessage-draft] clipboard_only fallback for ${contactLabel}: ${placement.reason ?? "no reason"}`,
+          console.error(
+            `[imessage-draft] no_recipient for ${contactLabel} (context_status=fda_denied)`,
           );
         } else {
-          imessageDraftStatus = "helper_failed";
-          assistantText = replaceDraftBlock(
-            assistantText,
-            `${body}\n\n(Couldn't place this in Messages: ${placement.error ?? "unknown error"}. Paste it manually.)`,
-          );
-          console.error(`[imessage-draft] helper failed: ${placement.error}`);
+          if (resolved) {
+            const handoff = await writeICloudDriveDraft({
+              recipient: resolved,
+              recipientLabel: contactLabel,
+              body,
+            });
+            if (handoff.ok) {
+              imessageDraftStatus = "placed";
+              imessageDraftMode = "icloud_drive_file";
+              imessageDraftHandoffPath = handoff.path;
+              imessageDraftBodySha256 = handoff.bodySha256;
+              imessageDraftShortcutUrl = handoff.shortcutUrl;
+              assistantText = rebuildAroundDraftBlock(
+                assistantText,
+                `${body}\n\nPhone handoff ready: ${handoff.shortcutUrl}`,
+              );
+              console.log(
+                `[imessage-draft] icloud_drive_file for ${contactLabel} (${resolved}) path=${handoff.path} sha256=${handoff.bodySha256}`,
+              );
+            } else {
+              console.error(
+                `[imessage-draft] Shortcuts iCloud handoff failed for ${contactLabel}: ${handoff.error ?? "unknown error"}`,
+              );
+            }
+          }
+
+          if (!imessageDraftMode) {
+            const target = resolved ?? NEW_COMPOSE_SENTINEL;
+            const placement = await placeIMessageDraft(PROJECT_ROOT, target, body);
+            if (placement.ok && placement.mode === "pasted") {
+              imessageDraftStatus = "placed";
+              imessageDraftMode = "pasted";
+              assistantText = rebuildAroundDraftBlock(
+                assistantText,
+                `${body}\n\nDraft is in the Messages compose box on your Mac for ${contactLabel}.`,
+              );
+              console.log(
+                `[imessage-draft] pasted into compose for ${contactLabel} (${resolved})`,
+              );
+            } else if (placement.ok && placement.mode === "new_compose") {
+              imessageDraftStatus = "placed";
+              imessageDraftMode = "new_compose";
+              assistantText = rebuildAroundDraftBlock(
+                assistantText,
+                `${body}\n\nI couldn't find a thread for ${contactLabel}, so I opened a new Messages compose on your Mac with the body prefilled. Pick the contact in the To field.`,
+              );
+              console.log(
+                `[imessage-draft] new_compose for ${contactLabel} (context_status=${imessageContextResult?.status})`,
+              );
+            } else if (placement.ok) {
+              imessageDraftStatus = "placed";
+              imessageDraftMode = "clipboard_only";
+              const where = resolved
+                ? `Messages on your Mac is open to the ${contactLabel} thread`
+                : `Messages on your Mac is open — press Cmd+N for a new message, pick ${contactLabel}`;
+              assistantText = rebuildAroundDraftBlock(
+                assistantText,
+                `${body}\n\nDraft is on your clipboard and ${where}. Paste with Cmd+V.`,
+              );
+              console.log(
+                `[imessage-draft] clipboard_only fallback for ${contactLabel}: ${placement.reason ?? "no reason"}`,
+              );
+            } else {
+              imessageDraftStatus = "helper_failed";
+              assistantText = rebuildAroundDraftBlock(
+                assistantText,
+                `${body}\n\n(Couldn't place this in Messages: ${placement.error ?? "unknown error"}.)`,
+              );
+              console.error(`[imessage-draft] helper failed: ${placement.error}`);
+            }
+          }
         }
       }
     }
@@ -748,9 +879,43 @@ bot.on("message:text", async (ctx) => {
       assistantText = replaceDraftBlock(assistantText, "").trim();
     }
 
-    await sendResponse(ctx, assistantText);
-    await saveMessage("assistant", assistantText);
-    await appendTurn(chatId, { role: "assistant", content: assistantText, ts: new Date().toISOString() });
+    // Compute the actually-sendable text ONCE so Telegram, the short-term
+    // turn buffer, and Supabase all agree. 2026-05-11 the Conor turn
+    // persisted an empty string here while sendResponse substituted the
+    // "I generated an empty response" apology — the state file lied about
+    // what the user actually saw.
+    const sendableText = ensureSendableResponse(
+      assistantText,
+      "I’m sorry, I generated an empty response. Please try again.",
+    );
+    await sendResponse(ctx, sendableText);
+    await saveMessage("assistant", sendableText);
+    await appendTurn(chatId, { role: "assistant", content: sendableText, ts: new Date().toISOString() });
+
+    // Background memory capture. Synchronous classification (regex match) so
+    // the decision record can include the reason; the actual file write is
+    // fire-and-forget — never blocks the reply, never throws into the queue.
+    const memoryCandidate = classifyMemoryCandidate({
+      userText: text,
+      assistantText: sendableText,
+      anchoredProjects: anchoredProjectNames,
+      retrievalUsed: referential,
+      retrievalHitCount: ftsHits.length,
+    });
+    if (memoryCandidate) {
+      void writeMemoryCandidate(memoryCandidate)
+        .then((r) => {
+          console.log(
+            `[memory-capture] ${r.reason} kind=${memoryCandidate.kind} dest=${memoryCandidate.destination} path=${r.path ?? "n/a"}`,
+          );
+        })
+        .catch((err) => {
+          console.error(
+            "[memory-capture] write failed:",
+            err instanceof Error ? err.message : String(err),
+          );
+        });
+    }
 
     const rec: DecisionRecord = {
       ts,
@@ -780,14 +945,23 @@ bot.on("message:text", async (ctx) => {
       imessage_context_contact: imessageContextResult?.request.contact,
       imessage_draft_status: imessageDraftStatus,
       imessage_draft_mode: imessageDraftMode,
+      imessage_draft_handoff_path: imessageDraftHandoffPath,
+      imessage_draft_body_sha256: imessageDraftBodySha256,
+      imessage_draft_shortcut_url: imessageDraftShortcutUrl,
       memory_tags_stripped: memoryTagsStripped,
       wrapper_tags_stripped: wrapperTagsStripped,
       scaffolding_tags_stripped: scaffoldingTagsStripped,
       turn_markers_stripped: turnMarkersStripped,
       prose_dashes_stripped: proseDashesStripped,
-      response_chars: assistantText.length,
+      response_chars: sendableText.length,
       catalog_response_used: Boolean(deterministicCatalogResponse),
       skipped_textbook_response_used: Boolean(deterministicTextbookResponse),
+      memory_capture_attempted: Boolean(memoryCandidate),
+      memory_capture_reason: memoryCandidate?.reason,
+      memory_capture_confidence: memoryCandidate?.confidence,
+      memory_capture_kind: memoryCandidate?.kind,
+      memory_capture_destination: memoryCandidate?.destination,
+      memory_capture_project: memoryCandidate?.project ?? undefined,
     };
     await logDecision(rec);
   });
@@ -1101,7 +1275,7 @@ function buildPrompt(
     // Hard rule logged 2026-05-11 after the user asked for an iMessage and
     // an email draft. The bot must NEVER send; only draft. Full policy in
     // ~/.claude/projects/.../memory/feedback_drafts_never_send.md.
-    "Drafting policy (hard rule): when the user asks you to write an email, iMessage, SMS, or any outbound message, produce a draft only. NEVER send the message yourself. NEVER call a tool that would send it. NEVER claim to have sent it. Return the draft text in chat and end the reply with an explicit line such as \"Draft above, review and send manually\" so the user knows they need to send it themselves. If the user later says \"just send it\" or \"you send it\", refuse politely and reiterate that you do not have a send action.",
+    "Drafting policy (hard rule): when the user asks you to write an email, iMessage, SMS, or any outbound message, produce a draft only. NEVER send the message yourself. NEVER call a tool that would send it. NEVER claim to have sent it. Return the draft body as the body of your reply — no policy footer, no \"Draft above\", no \"send manually\", no \"review and send\", no \"I can't send for you\". The relay tells the user where the draft is; you do not need to remind them. If the user later says \"just send it\" or \"you send it\", refuse politely in one sentence and stop.",
     // Helper scripts the bot can invoke via its Bash tool. Documented in
     // docs/IMESSAGE-SETUP.md. The two draft helpers do NOT require Full Disk
     // Access; they drop the draft into the native compose surface and the
@@ -1114,7 +1288,7 @@ function buildPrompt(
     "Context cleanup rule (hard): never save the fetched context to a local file. The read helper streams JSON to stdout; consume it in your working memory only. Do NOT write context to ~/Projects/claude-telegram-relay/data/ or anywhere else on disk. If you find an existing cached context file from a prior session (e.g. data/mom-imessages.json), delete it after use rather than reusing it. The user's machine is the source of truth; re-read fresh from chat.db each time rather than caching.",
     "iMessage handling is deterministic in this runtime. The relay reads thread context before you run and places drafts after you run (using the marker pattern described below when relevant). Do NOT attempt to call scripts/imessage-thread.sh or scripts/draft-imessage.sh yourself; in headless mode you have no Bash approval surface and the call will surface as a confusing 'blocked for approval' message to the user. Just respond in text and use the markers when asked to place a draft.",
     "For email drafts, you may use one helper via Bash:",
-    "- scripts/draft-email.sh TO SUBJECT (body on stdin). Opens the user's default mail client with a new draft pre-filled. Example: `printf '%s' \"Body...\" | scripts/draft-email.sh wregan599@gmail.com \"Subject line\"`. After running, tell the user: \"Email draft is open in your mail client. Review and send when ready.\"",
+    "- scripts/draft-email.sh TO SUBJECT (body on stdin). Opens the user's default mail client with a new draft pre-filled. Example: `printf '%s' \"Body...\" | scripts/draft-email.sh wregan599@gmail.com \"Subject line\"`. After running, say only: \"Email draft is open in your mail client.\"",
     // Durable writing-style rules for any outgoing draft the user will send
     // under his own name. Source of truth (verbatim) lives at
     //   ~/ObsidianVault/02-Cross-Project/writing_style_for_william.md
@@ -1139,11 +1313,11 @@ function buildPrompt(
   if (opts?.iMessageDraftContact) {
     const contact = opts.iMessageDraftContact;
     parts.push(
-      `\niMessage placement (this message): the user wants the draft for ${contact} placed directly in Messages.app's compose box. Output the iMessage body — and only the body — between the literal marker lines below, each on its own line:`,
+      `\niMessage handoff (this message): the user wants a draft for ${contact}. The relay will handle placement after you respond — usually by writing the draft for the iPhone Shortcut handoff, with the Mac Messages compose path as a fallback. Output the iMessage body — and only the body — between the literal marker lines below, each on its own line:`,
       DRAFT_MARKER_OPEN,
       "(the iMessage body)",
       DRAFT_MARKER_CLOSE,
-      `You may add one short lead sentence before the markers (e.g. "Here's the draft for ${contact}:"). The relay will deterministically pbcopy the body and open Messages on the right thread once you respond. Do NOT call any tool, do NOT mention scripts, and NEVER say the placement was blocked for approval — there is no approval surface in this runtime.`,
+      `You may add one short lead sentence BEFORE the opening marker (e.g. "Here's the draft for ${contact}:"). Write NOTHING after the closing marker. The relay appends its own handoff status line based on what actually happened (iPhone Shortcut handoff, Mac compose fallback, clipboard fallback, or failure), and any line you add will either be discarded or contradict the truth. In particular: do NOT write "Draft is in the Messages compose box", "Draft is placed", "Ready to send", "I've opened Messages", or any variation — the relay owns that status. Do NOT call any tool, do NOT mention scripts, and NEVER say the placement was blocked for approval — there is no approval surface in this runtime.`,
     );
   }
 
@@ -1165,6 +1339,34 @@ function buildPrompt(
   return parts.join("\n");
 }
 
+/**
+ * Extract a `shortcuts://run-shortcut?name=...` URL from a draft handoff
+ * reply and convert it to an inline keyboard button. Keep a visible fallback
+ * URL too: Telegram/iOS custom-scheme behavior is client-dependent, and if
+ * the button fails the user still needs something copyable.
+ *
+ * Replaces "Phone handoff ready: <url>" with a concise visible fallback and
+ * returns reply_markup with one inline button. Returns null reply_markup when
+ * no handoff URL is present.
+ */
+const PHONE_HANDOFF_LINE_RE =
+  /\n*[ \t]*Phone handoff ready:\s*(shortcuts:\/\/run-shortcut\?name=[^\s]+)\s*\n*/i;
+function extractHandoffButton(
+  response: string,
+): { text: string; replyMarkup?: { inline_keyboard: Array<Array<{ text: string; url: string }>> } } {
+  const m = response.match(PHONE_HANDOFF_LINE_RE);
+  if (!m) return { text: response };
+  const url = m[1];
+  const stripped = response.replace(PHONE_HANDOFF_LINE_RE, "\n\n").trimEnd();
+  const fallback = `Open on iPhone: ${url}`;
+  return {
+    text: stripped.trim().length > 0 ? `${stripped}\n\n${fallback}` : fallback,
+    replyMarkup: {
+      inline_keyboard: [[{ text: "📲 Open draft on iPhone", url }]],
+    },
+  };
+}
+
 async function sendResponse(ctx: Context, response: string): Promise<void> {
   // Telegram has a 4096 character limit
   const MAX_LENGTH = 4000;
@@ -1173,14 +1375,22 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
     "I’m sorry, I generated an empty response. Please try again.",
   );
 
-  if (response.length <= MAX_LENGTH) {
-    await ctx.reply(response);
+  // Pull out the shortcuts:// handoff URL (if any) so it can be sent as a
+  // real tappable inline button instead of dead plain text.
+  const { text, replyMarkup } = extractHandoffButton(response);
+  const finalReplyMarkup = replyMarkup
+    ? { reply_markup: replyMarkup }
+    : undefined;
+
+  if (text.length <= MAX_LENGTH) {
+    await ctx.reply(text, finalReplyMarkup);
     return;
   }
 
-  // Split long responses
+  // Split long responses. Attach the inline keyboard to the LAST chunk only
+  // so the button appears below the final message bubble (Telegram convention).
   const chunks = [];
-  let remaining = response;
+  let remaining = text;
 
   while (remaining.length > 0) {
     if (remaining.length <= MAX_LENGTH) {
@@ -1198,8 +1408,9 @@ async function sendResponse(ctx: Context, response: string): Promise<void> {
     remaining = remaining.substring(splitIndex).trim();
   }
 
-  for (const chunk of chunks) {
-    await ctx.reply(chunk);
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+    await ctx.reply(chunks[i], isLast ? finalReplyMarkup : undefined);
   }
 }
 
@@ -1255,10 +1466,15 @@ async function runStartupPreflight(): Promise<void> {
     retrievalAvailable = true;
     retrievalStartupError = undefined;
   } catch (err) {
-    retrievalAvailable = false;
+    // Startup preflight is diagnostic only. SQLite can transiently lock while
+    // the indexer is active; permanently disabling retrieval for the whole
+    // launch would leave FTS off until the next manual restart. Per-request
+    // searches already catch and log their own errors, so keep retrieval
+    // enabled and retry when the user actually asks a referential question.
+    retrievalAvailable = true;
     retrievalStartupError = err instanceof Error ? err.message : String(err);
     console.error(
-      "[relay] retrieval preflight failed; continuing without indexed retrieval:",
+      "[relay] retrieval preflight failed; will retry indexed retrieval per request:",
       retrievalStartupError,
     );
   }

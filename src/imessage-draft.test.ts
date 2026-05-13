@@ -2,8 +2,11 @@ import { expect, test } from "bun:test";
 import {
   DRAFT_MARKER_CLOSE,
   DRAFT_MARKER_OPEN,
+  NEW_COMPOSE_SENTINEL,
   extractDraftBody,
+  rebuildAroundDraftBlock,
   replaceDraftBlock,
+  stripPlacementClaims,
 } from "./imessage-draft";
 
 const wrap = (body: string) =>
@@ -44,4 +47,167 @@ test("replaceDraftBlock strips orphan markers when no pair exists", () => {
   expect(out).not.toContain(DRAFT_MARKER_OPEN);
   expect(out).not.toContain(DRAFT_MARKER_CLOSE);
   expect(out).toContain("Draft preview:");
+});
+
+// Regression: 2026-05-11 screenshot. Claude wrote a trailing "Draft in the
+// Messages compose box for Galene. Review and send when ready." line AFTER
+// the closing marker. The relay's no_recipient hint said "Couldn't open
+// Messages — no thread found for galene." and Telegram showed both,
+// contradicting each other. rebuildAroundDraftBlock must discard everything
+// after the closing marker so only the relay's status reaches the user.
+test("rebuildAroundDraftBlock discards trailing hallucinated success claim", () => {
+  const input = [
+    "Here's the draft for Galene:",
+    "",
+    DRAFT_MARKER_OPEN,
+    "Thanks again for taking the reins on coordinating tomorrow's meeting.",
+    DRAFT_MARKER_CLOSE,
+    "",
+    "Draft in the Messages compose box for Galene. Review and send when ready.",
+  ].join("\n");
+
+  const hint = "Couldn't open Messages on your Mac — no thread found for galene.";
+  const out = rebuildAroundDraftBlock(input, `[body]\n\n${hint}`);
+
+  expect(out).toContain("Here's the draft for Galene:");
+  expect(out).toContain("[body]");
+  expect(out).toContain(hint);
+  expect(out).not.toContain("Draft in the Messages compose box");
+  expect(out).not.toContain("Review and send when ready");
+  expect(out).not.toContain(DRAFT_MARKER_OPEN);
+  expect(out).not.toContain(DRAFT_MARKER_CLOSE);
+});
+
+test("rebuildAroundDraftBlock strips placement claims from the lead too", () => {
+  const input = [
+    "I've placed the draft in Messages for Peggy.",
+    "Here's the draft for Peggy:",
+    DRAFT_MARKER_OPEN,
+    "Body.",
+    DRAFT_MARKER_CLOSE,
+  ].join("\n");
+
+  const out = rebuildAroundDraftBlock(input, "[relay status]");
+  expect(out).toContain("Here's the draft for Peggy:");
+  expect(out).toContain("[relay status]");
+  expect(out).not.toMatch(/I've placed the draft/i);
+});
+
+test("rebuildAroundDraftBlock returns only the replacement when there is no lead", () => {
+  const input = `${DRAFT_MARKER_OPEN}\nBody.\n${DRAFT_MARKER_CLOSE}\nDraft is placed.`;
+  const out = rebuildAroundDraftBlock(input, "[status]");
+  expect(out).toBe("[status]");
+});
+
+test("rebuildAroundDraftBlock falls back gracefully when no markers exist", () => {
+  const input = [
+    "Here's the draft for Peggy:",
+    "Body text.",
+    "Draft is in the Messages compose box for Peggy. Review and send when ready.",
+  ].join("\n");
+  const out = rebuildAroundDraftBlock(input, "[status]");
+  expect(out).toContain("Here's the draft for Peggy:");
+  expect(out).toContain("Body text.");
+  expect(out).toContain("[status]");
+  expect(out).not.toMatch(/Draft is in the Messages compose box/i);
+});
+
+test("stripPlacementClaims removes common hallucinated placement lines", () => {
+  const input = [
+    "Body text stays.",
+    "Draft is in the Messages compose box for Galene. Review and send when ready.",
+    "I've placed the draft in Messages for Peggy.",
+    "Opened Messages on her thread.",
+    "More body text stays.",
+  ].join("\n");
+
+  const out = stripPlacementClaims(input);
+  expect(out).toContain("Body text stays.");
+  expect(out).toContain("More body text stays.");
+  expect(out).not.toMatch(/Draft is in the Messages/i);
+  expect(out).not.toMatch(/I've placed the draft/i);
+  expect(out).not.toMatch(/Opened Messages/i);
+});
+
+test("stripPlacementClaims is a no-op for normal text", () => {
+  const input = "Hey Peggy, hoping for a deep clean this week. Thanks!";
+  expect(stripPlacementClaims(input)).toBe(input);
+});
+
+// Regression: 2026-05-11 feedback "Never say send manually again". Claude was
+// appending the drafting-policy footer to every draft response. Strip every
+// known variant of that line so it never reaches Telegram.
+test("stripPlacementClaims removes 'Draft above, review and send manually' boilerplate", () => {
+  const input = [
+    "Here's the draft for Conor:",
+    "Hope all is well, man.",
+    "Draft above, review and send manually.",
+  ].join("\n");
+  const out = stripPlacementClaims(input);
+  expect(out).toContain("Here's the draft for Conor:");
+  expect(out).toContain("Hope all is well, man.");
+  expect(out).not.toMatch(/Draft above/i);
+  expect(out).not.toMatch(/send manually/i);
+});
+
+test("stripPlacementClaims removes 'send it manually' / 'send it yourself' variants", () => {
+  const input = [
+    "Body line.",
+    "Send it manually when you're ready.",
+    "You'll need to send it yourself.",
+    "I cannot send this for you.",
+    "More body line.",
+  ].join("\n");
+  const out = stripPlacementClaims(input);
+  expect(out).toContain("Body line.");
+  expect(out).toContain("More body line.");
+  expect(out).not.toMatch(/send it manually/i);
+  expect(out).not.toMatch(/send it yourself/i);
+  expect(out).not.toMatch(/cannot send/i);
+});
+
+test("stripPlacementClaims safety guard: never empties a non-empty response", () => {
+  // 2026-05-11: an over-aggressive pattern (`(?:you'll|you\s+will|you)\s+
+  // (?:need|have|can)\s+to\s+send`) ate the entire response, producing
+  // "I'm sorry, I generated an empty response" on Telegram. The safety
+  // guard now returns the original text if the strip would empty it.
+  // Worst case: the user sees one boilerplate line. Better than an
+  // apology with no content.
+  const relayStatus = "Draft is in the Messages compose box on your Mac for Gaileen. Review and send from there when ready.";
+  // Without the guard this would empty out (pattern 1 matches the whole
+  // line). With the guard, the original is returned and the caller — by
+  // contract — only ever runs the strip BEFORE adding the relay status.
+  expect(stripPlacementClaims(relayStatus)).toBe(relayStatus);
+});
+
+test("stripPlacementClaims preserves legitimate body lines that mention 'send'", () => {
+  // Regression for the 8:24 PM Conor failure where Claude returned a
+  // legitimate reply and the over-broad pattern stripped it to empty.
+  const input = [
+    "You need to send Conor a phone number first.",
+    "Then I can place the draft directly into Messages.",
+  ].join("\n");
+  expect(stripPlacementClaims(input)).toBe(input);
+});
+
+test("stripPlacementClaims preserves placement-like lines inside draft markers", () => {
+  const input = [
+    "Lead.",
+    DRAFT_MARKER_OPEN,
+    "I can't send it today.",
+    "I have placed the draft notes in the folder.",
+    DRAFT_MARKER_CLOSE,
+    "Draft is in the Messages compose box for Peggy.",
+  ].join("\n");
+  const out = stripPlacementClaims(input);
+  expect(extractDraftBody(out)).toBe(
+    "I can't send it today.\nI have placed the draft notes in the folder.",
+  );
+  expect(out).not.toMatch(/Messages compose box for Peggy/i);
+});
+
+test("NEW_COMPOSE_SENTINEL is the documented '?' character", () => {
+  // Keeping this in lockstep with scripts/draft-imessage.sh's is_blank_sentinel.
+  // If you change this constant, update the script's recognized sentinels.
+  expect(NEW_COMPOSE_SENTINEL).toBe("?");
 });

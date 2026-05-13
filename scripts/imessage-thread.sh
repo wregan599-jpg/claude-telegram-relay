@@ -81,22 +81,20 @@ resolve_recipient() {
     return 0
   fi
 
-  local q
-  q="$(sql_string "$input")"
-
-  if [[ -r "$CONTACTS_DB" ]]; then
+  # Primary resolver: a Python helper that searches every AddressBook source
+  # database (iCloud/Exchange/CardDAV subdirs under
+  # ~/Library/Application Support/AddressBook/Sources/*/) and fuzzy-matches
+  # the input against name tokens. The top-level AddressBook-v22.abcddb on
+  # this Mac holds only the "me" record, which is why the old strict
+  # substring query against just that DB always missed real contacts. The
+  # helper handles direct identifiers, blocks relationship aliases, and
+  # returns an empty string if no good match exists.
+  local script_dir
+  script_dir="$(cd "$(dirname "$0")" && pwd)"
+  local resolver="$script_dir/resolve-contact.py"
+  if [[ -x "$resolver" ]] && command -v python3 >/dev/null 2>&1; then
     local contact
-    contact="$(sqlite3 -readonly "$CONTACTS_DB" <<SQL
-SELECT COALESCE(p.ZFULLNUMBER, e.ZADDRESS, '')
-FROM ZABCDRECORD r
-LEFT JOIN ZABCDPHONENUMBER p ON p.ZOWNER = r.Z_PK OR p.Z22_OWNER = r.Z_PK
-LEFT JOIN ZABCDEMAILADDRESS e ON e.ZOWNER = r.Z_PK OR e.Z22_OWNER = r.Z_PK
-WHERE lower(COALESCE(r.ZFIRSTNAME,'') || ' ' || COALESCE(r.ZLASTNAME,'') || ' ' || COALESCE(r.ZNICKNAME,'') || ' ' || COALESCE(r.ZORGANIZATION,'')) LIKE '%' || lower('$q') || '%'
-  AND COALESCE(p.ZFULLNUMBER, e.ZADDRESS, '') != ''
-ORDER BY p.ZISPRIMARY DESC, e.ZISPRIMARY DESC, r.ZMODIFICATIONDATE DESC
-LIMIT 1;
-SQL
-)"
+    contact="$("$resolver" "$input" 2>/dev/null)"
     if [[ -n "$contact" ]]; then
       printf "%s" "$contact"
       return 0
@@ -107,10 +105,13 @@ SQL
     return 0
   fi
 
-  # Last-resort fallback for contacts not saved in AddressBook: find a
-  # one-on-one thread where the specific name appears in message text, then
-  # use that chat identifier. Do not use this for short or relationship-style
-  # aliases; those are too ambiguous to place a draft safely.
+  # Last-resort fallback for contacts not saved in any AddressBook source:
+  # find a one-on-one thread where the specific name appears in message
+  # text, then use that chat identifier. Do not use this for short or
+  # relationship-style aliases; those are too ambiguous to place a draft
+  # safely.
+  local q
+  q="$(sql_string "$input")"
   sqlite3 -readonly "$DB" <<SQL
 SELECT c.chat_identifier
 FROM message m

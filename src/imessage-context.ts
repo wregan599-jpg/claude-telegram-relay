@@ -71,12 +71,53 @@ function detectPlacementSuppression(message: string): boolean {
   );
 }
 
-const DRAFT_VERB_RE = /\b(draft|write|compose|send|shoot|text|message)\b/;
+const DRAFT_VERB_RE = /\b(draft|write|compose|send|shoot|text|message|respond|reply|ping)\b/;
 const MESSAGE_TYPE_RE = /\b(imessage|imessages|text\s+messages?|texts?|sms|message|messages|chat\s+message)\b/;
 const CONTEXT_SIGNAL_RE = /\b(last|recent|previous|prior|context|history|go\s+through|look\s+through|read\s+(?:my|our|the))\b/;
+// "Respond to Conor saying hi" and "Reply to Conor" clearly mean iMessage —
+// no explicit "message" type keyword is required. We still defer to an email
+// keyword to avoid hijacking "respond to John's email".
+const IMPLICIT_MESSAGE_VERB_RE = /\b(respond|reply|ping)\s+to\b/;
+const EMAIL_TYPE_RE = /\b(email|e-mail|gmail|inbox|mailbox)\b/;
+
+// Past-tense / meta references to a prior draft. Live failure 2026-05-13T00:14Z:
+// "In your draft to Peggy did not not ready through her previous text messages
+// for context?" was treated as a new draft request because "draft" + "messages"
+// + "to Peggy" all matched. It's a question ABOUT a past draft, not a new
+// request. Shape: <possessive determiner> <draft-noun> <recipient indicator>.
+// The trailing (to|for|with|about) is required so "directly in the iMessage
+// box" (placement phrasing, no recipient indicator) does not match.
+const PAST_DRAFT_REFERENCE_RE =
+  /\b(?:your|the|that|this|my|our|his|her|their|last|previous|previously|earlier|prior)\s+(?:draft|message|reply|response|text|imessage|sms|email|note)\s+(?:to|for|with|about)\b/i;
+
+function isPastDraftReference(message: string): boolean {
+  return PAST_DRAFT_REFERENCE_RE.test(message);
+}
+
+// Self-recipient: "Reply to myself saying X", "Draft a message to me",
+// "Text myself a reminder". The proper-noun regex below requires
+// capitalization, so "myself"/"me" never match and the request falls through
+// to the generic chat path — which on 2026-05-13 took Claude to a 90s
+// timeout because the bot had no draft pathway to follow. Detecting these
+// up front routes the request through the normal placement pipeline with
+// contact="myself", which the helper short-circuits to RELAY_SELF_RECIPIENT
+// (or its fallback) in fetchIMessageContext below.
+const SELF_RECIPIENT_RE =
+  /\b(?:[Ww]ith|[Tt]o)\s+(?:myself|me)\b|\b(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:myself|me)\b/;
+const SELF_DRAFT_INTENT_RE =
+  /\b(?:[Rr]eply|[Rr]espond)\s+to\s+(?:myself|me)\b|\b(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:myself|me)\b|\b(?:[Dd]raft|[Ww]rite|[Cc]ompose|[Ss]end|[Ss]hoot)\s+(?:myself|me)\s+(?:a|an)\s+(?:imessage|text|sms|message)\b|\b(?:[Dd]raft|[Ww]rite|[Cc]ompose|[Ss]end|[Ss]hoot)\s+(?:a|an)\s+(?:imessage|text|sms|message)\s+(?:to|for|with)\s+(?:myself|me)\b/;
+export const SELF_CONTACT = "myself";
 
 function hasDraftVerbAndType(message: string): boolean {
   const m = message.toLowerCase();
+  if (EMAIL_TYPE_RE.test(m)) return false;
+  // Suppress when the message references a prior draft — meta-question, not
+  // a new draft request. Critical: this runs BEFORE the implicit-verb path
+  // so "in your reply to Peggy did you..." doesn't get hijacked by the
+  // `reply to` heuristic.
+  if (isPastDraftReference(message)) return false;
+  if (SELF_DRAFT_INTENT_RE.test(message)) return true;
+  if (IMPLICIT_MESSAGE_VERB_RE.test(m)) return true;
   return DRAFT_VERB_RE.test(m) && MESSAGE_TYPE_RE.test(m);
 }
 
@@ -99,6 +140,50 @@ function cleanContact(raw: string): string {
     .replace(/[,.!?;:]+$/g, "")
     .replace(/\s+(for|about|letting|saying|telling)\b.*$/i, "")
     .trim();
+}
+
+function cleanDirectDraftBody(raw: string): string | undefined {
+  const body = raw
+    // Remove placement instructions that are not part of the body.
+    .replace(
+      /\s+(?:directly\s+)?(?:in|into)\s+(?:the\s+)?(?:imessage|messages?|message|chat)\s*(?:box|app|compose(?:\s+box)?)?\b.*$/i,
+      "",
+    )
+    .replace(/^["'“”]+|["'“”]+$/g, "")
+    .trim();
+  return body.length > 0 ? body : undefined;
+}
+
+/**
+ * Extracts an exact draft body when the user supplies one in the same turn:
+ * "Reply to myself saying testing", "Text me with hello", or
+ * "Draft an iMessage to Peggy: thanks". This is intentionally conservative:
+ * descriptive asks like "letting her know that..." still go through Claude so
+ * it can turn the instruction into polished prose.
+ */
+function sameText(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  return normalize(a) === normalize(b);
+}
+
+function extractDirectDraftBody(
+  message: string,
+  contact?: string,
+): string | undefined {
+  const saying = message.match(/\b(?:saying|say)\s+([\s\S]+)$/i);
+  if (saying) return cleanDirectDraftBody(saying[1]);
+
+  const withBody = message.match(/.*\bwith\s+([\s\S]+)$/i);
+  if (withBody) {
+    const body = cleanDirectDraftBody(withBody[1]);
+    return sameText(body, contact) ? undefined : body;
+  }
+
+  const colon = message.match(/\b(?:imessage|text|sms|message)\s+(?:to|for|with)\s+[^:]{1,80}:\s+([\s\S]+)$/i);
+  if (colon) return cleanDirectDraftBody(colon[1]);
+
+  return undefined;
 }
 
 /**
@@ -124,6 +209,12 @@ export interface IMessageDraftRequest {
   wantsContext: boolean;
   contextLimit: number;
   wantsPlacement: boolean;
+  /**
+   * Exact body supplied by the user in this turn. When present and no prior
+   * thread context was requested, the relay can place the draft without a
+   * Claude round trip or marker compliance risk.
+   */
+  directBody?: string;
 }
 
 export function extractIMessageDraftRequest(
@@ -131,8 +222,26 @@ export function extractIMessageDraftRequest(
 ): IMessageDraftRequest | null {
   if (!hasDraftVerbAndType(message)) return null;
 
+  // Self-recipient first: "Reply to myself saying X" must not require a
+  // proper-noun match to count. See SELF_RECIPIENT_RE comment above.
+  if (SELF_DRAFT_INTENT_RE.test(message) || SELF_RECIPIENT_RE.test(message)) {
+    const directBody = extractDirectDraftBody(message, SELF_CONTACT);
+    return {
+      contact: SELF_CONTACT,
+      wantsContext: false,
+      contextLimit: parseLimit(message),
+      wantsPlacement: !detectPlacementSuppression(message),
+      ...(directBody ? { directBody } : {}),
+    };
+  }
+
+  // Prefix keyword is case-insensitive ([Ww]ith / [Tt]o), but the proper-noun
+  // branch must require real capitalization. A global /i flag caused
+  // "Nono it needs to be in my iMessages compose box" to capture "be in my"
+  // as a three-word "proper noun" — case-insensitive [A-Z] matches lowercase.
+  // The email branch stays case-insensitive via explicit [A-Za-z].
   const explicit = message.match(
-    /\b(?:with|to)\s+([+()\-\d\s]{7,}|[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/i,
+    /\b(?:[Ww]ith|[Tt]o)\s+([+()\-\d\s]{7,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/,
   );
   if (!explicit) return null;
 
@@ -142,19 +251,42 @@ export function extractIMessageDraftRequest(
   const m = message.toLowerCase();
   const wantsContext = CONTEXT_SIGNAL_RE.test(m);
   const wantsPlacement = !detectPlacementSuppression(message);
+  const directBody = wantsContext ? undefined : extractDirectDraftBody(message, contact);
 
   return {
     contact,
     wantsContext,
     contextLimit: parseLimit(message),
     wantsPlacement,
+    ...(directBody ? { directBody } : {}),
   };
+}
+
+/**
+ * Recipient the relay uses when the user says "myself" / "me". Override via
+ * `RELAY_SELF_RECIPIENT` env var (phone or email). Fallback is William's
+ * Apple-ID email so a missing env var still produces a valid handoff. We
+ * short-circuit the helper for this case because (a) imessage-thread.sh
+ * returns empty for "myself" anyway, and (b) drafting to yourself doesn't
+ * need prior thread context.
+ */
+function resolveSelfRecipient(): string {
+  return process.env.RELAY_SELF_RECIPIENT?.trim() || "wregan599@gmail.com";
 }
 
 export async function fetchIMessageContext(
   projectRoot: string,
   request: IMessageContextRequest,
 ): Promise<IMessageContextResult> {
+  if (request.contact === SELF_CONTACT) {
+    return {
+      request,
+      status: "empty",
+      messages: [],
+      resolvedRecipient: resolveSelfRecipient(),
+    };
+  }
+
   const script = join(projectRoot, "scripts", "imessage-thread.sh");
   const proc = spawn([script, request.contact, String(request.limit)], {
     stdout: "pipe",
@@ -163,8 +295,9 @@ export async function fetchIMessageContext(
     env: { ...process.env },
   });
 
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    setTimeout(() => {
+    timeoutId = setTimeout(() => {
       try {
         proc.kill("SIGKILL");
       } catch {
@@ -183,6 +316,7 @@ export async function fetchIMessageContext(
       ]),
       timeout,
     ]);
+    if (timeoutId) clearTimeout(timeoutId);
 
     if (code === 77) {
       return {
@@ -219,6 +353,7 @@ export async function fetchIMessageContext(
       resolvedRecipient,
     };
   } catch (err) {
+    if (timeoutId) clearTimeout(timeoutId);
     const msg = err instanceof Error ? err.message : String(err);
     return {
       request,
