@@ -1,5 +1,7 @@
-export const TELEGRAM_POLLING_CONFLICT_INITIAL_DELAY_MS = 30_000;
-export const TELEGRAM_POLLING_CONFLICT_MAX_DELAY_MS = 5 * 60_000;
+// Retry interval when another poller holds the bot token.
+// Short and fixed — no exponential backoff. The relay must reclaim the token
+// within one second of the competing poller dying, not after a multi-minute wait.
+export const TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS = 1_000;
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -31,11 +33,4 @@ export function isTelegramPollingConflictError(error: unknown): boolean {
   const msg = errorMessage(error);
   return /\b409\b/.test(msg) &&
     /getUpdates|terminated by other getUpdates|long polling|Conflict/i.test(msg);
-}
-
-export function nextTelegramPollingConflictDelayMs(
-  currentDelayMs: number,
-  maxDelayMs = TELEGRAM_POLLING_CONFLICT_MAX_DELAY_MS,
-): number {
-  return Math.min(currentDelayMs * 2, maxDelayMs);
 }

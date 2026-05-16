@@ -73,9 +73,8 @@ import {
   sendTelegramResponse,
 } from "./telegram-response.ts";
 import {
-  TELEGRAM_POLLING_CONFLICT_INITIAL_DELAY_MS,
+  TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
   isTelegramPollingConflictError,
-  nextTelegramPollingConflictDelayMs,
 } from "./telegram-polling.ts";
 import { getSupabaseFeatureConfig } from "./supabase-config.ts";
 import { checkRelayBinaries, archLabel } from "./arch-check.ts";
@@ -1876,9 +1875,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function startTelegramPollingWithBackoff(): Promise<void> {
-  let retryDelayMs = TELEGRAM_POLLING_CONFLICT_INITIAL_DELAY_MS;
-
+async function startTelegramPolling(): Promise<void> {
   for (;;) {
     try {
       await bot.start({
@@ -1895,12 +1892,11 @@ async function startTelegramPollingWithBackoff(): Promise<void> {
 
       console.error(
         `[bot] Telegram getUpdates conflict; another poller is using this bot token. ` +
-        `Keeping this relay alive and retrying in ${Math.round(retryDelayMs / 1000)}s.`,
+        `Retrying in ${TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS}ms.`,
       );
-      await sleep(retryDelayMs);
-      retryDelayMs = nextTelegramPollingConflictDelayMs(retryDelayMs);
+      await sleep(TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS);
     }
   }
 }
 
-await startTelegramPollingWithBackoff();
+await startTelegramPolling();

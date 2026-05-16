@@ -1,8 +1,7 @@
 import { expect, test } from "bun:test";
 import {
-  TELEGRAM_POLLING_CONFLICT_MAX_DELAY_MS,
+  TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
   isTelegramPollingConflictError,
-  nextTelegramPollingConflictDelayMs,
 } from "./telegram-polling";
 
 test("detects Telegram getUpdates 409 conflict objects", () => {
@@ -33,9 +32,6 @@ test("does not classify unrelated Telegram errors as polling conflicts", () => {
   ).toBe(false);
 });
 
-test("polling conflict retry delay backs off up to the cap", () => {
-  expect(nextTelegramPollingConflictDelayMs(30_000)).toBe(60_000);
-  expect(nextTelegramPollingConflictDelayMs(TELEGRAM_POLLING_CONFLICT_MAX_DELAY_MS)).toBe(
-    TELEGRAM_POLLING_CONFLICT_MAX_DELAY_MS,
-  );
+test("polling conflict retry delay is short and fixed", () => {
+  expect(TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS).toBe(1_000);
 });
