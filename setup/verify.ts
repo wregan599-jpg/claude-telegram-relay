@@ -323,11 +323,11 @@ async function main() {
           "bun is currently running under Rosetta — this relay stops working in macOS 28. " +
           "Fix: curl -fsSL https://bun.sh/install | bash",
         );
-      } else if (!archReport.hasWarnings) {
+      } else if (!archReport.bun.rosettaWarning && !archReport.claude.rosettaWarning) {
         pass("No Intel-only binaries detected — relay is macOS 28 ready");
       }
     } catch (err) {
-      warn(`Arch check failed: ${err instanceof Error ? err.message : String(err)}`);
+      warn(`Arch check failed (macOS 28 readiness check): ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
