@@ -73,6 +73,7 @@ import {
   sendTelegramResponse,
 } from "./telegram-response.ts";
 import { getSupabaseFeatureConfig } from "./supabase-config.ts";
+import { checkRelayBinaries, archLabel } from "./arch-check.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -1773,6 +1774,27 @@ async function runStartupPreflight(): Promise<void> {
   console.log(`[relay] Claude timeout: ${CLAUDE_TIMEOUT_MS}ms`);
 
   await verifyClaudeExecutable();
+
+  // Architecture check — warns if bun or claude are Intel-only (will break in macOS 28).
+  try {
+    const archReport = checkRelayBinaries(CLAUDE_PATH);
+    console.log(`[preflight] bun arch: ${archLabel(archReport.bun.arch)} (${archReport.bun.path})`);
+    console.log(`[preflight] claude arch: ${archLabel(archReport.claude.arch)} (${archReport.claude.path})`);
+    if (archReport.currentProcessRosetta) {
+      console.error(
+        "[preflight] WARNING: bun is running under Rosetta translation. " +
+        "This relay will stop working in macOS 28. " +
+        "Reinstall bun for Apple silicon: curl -fsSL https://bun.sh/install | bash",
+      );
+    } else if (archReport.hasWarnings) {
+      console.error(
+        "[preflight] WARNING: one or more relay binaries are Intel-only and will stop working in macOS 28. " +
+        "Update them to a Universal or Apple silicon version.",
+      );
+    }
+  } catch (err) {
+    console.error("[preflight] arch check failed:", err instanceof Error ? err.message : String(err));
+  }
 
   console.log("[relay] running retrieval preflight...");
   try {
