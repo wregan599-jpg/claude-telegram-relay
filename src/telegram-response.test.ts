@@ -12,17 +12,22 @@ test("prepareTelegramResponseText applies fallback and phone handoff formatting"
     prepareTelegramResponseText(
       "Draft\n\nPhone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft",
     ),
-  ).toBe("Draft");
+  ).toBe("Draft\n\nRun ClaudeDraft in Shortcuts on your iPhone.");
   expect(
     prepareTelegramResponseText(
       "heading to London\n\nPhone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft",
     ),
-  ).toBe("heading to London");
+  ).toBe("heading to London\n\nRun ClaudeDraft in Shortcuts on your iPhone.");
   expect(
     prepareTelegramResponseText(
       "Phone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft",
     ),
   ).toBe("Run ClaudeDraft in Shortcuts on your iPhone.");
+  expect(
+    prepareTelegramResponseText(
+      "Draft\n\nOpen on iPhone: shortcuts://run-shortcut?name=ClaudeDraft",
+    ),
+  ).toBe("Draft\n\nRun ClaudeDraft in Shortcuts on your iPhone.");
 });
 
 test("splitTelegramResponseText never emits empty chunks on hard boundaries", () => {
