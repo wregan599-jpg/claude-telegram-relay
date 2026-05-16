@@ -245,8 +245,18 @@ async function main() {
 
     console.log(`\n${bold("  iMessage Contact Resolver")}`);
     const resolverPath = join(PROJECT_ROOT, "scripts", "resolve-contact.py");
+    // If RELAY_PYTHON is set, use it — it pins the interpreter across Terminal/launchd
+    // PATH differences. Otherwise default to python3 on the launchd-style PATH.
+    const pinnedPython = env.RELAY_PYTHON || "";
     const launchdPath = `${homedir()}/.bun/bin:/usr/local/bin:/usr/bin:/bin`;
     const resolverEnv = { ...process.env, PATH: launchdPath, HOME: homedir() };
+    const effectivePython = pinnedPython || "python3";
+
+    if (pinnedPython) {
+      pass(`RELAY_PYTHON pinned: ${pinnedPython}`);
+    } else {
+      warn("RELAY_PYTHON not set — using python3 on launchd PATH (may differ from your shell)");
+    }
 
     if (!existsSync(resolverPath)) {
       fail(`Contact resolver missing: ${resolverPath}`);
@@ -266,37 +276,38 @@ async function main() {
         "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}'); raise SystemExit(0 if sys.version_info >= (3, 7) else 1)",
       ]);
       if (version.code === 0) {
-        pass(`python3 ${version.stdout.trim()} available`);
+        pass(`python3 ${version.stdout.trim()} available (interactive PATH)`);
       } else {
         fail(`python3 must be >= 3.7 for scripts/resolve-contact.py; got ${version.stdout.trim() || version.stderr.trim() || "unknown"}`);
       }
     }
 
+    const launchdPythonCmd = pinnedPython
+      ? `${pinnedPython} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")'`
+      : `command -v python3 && python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")'`;
     const launchdPython = await runCommand(
-      [
-        "/bin/sh",
-        "-c",
-        "command -v python3 && python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\")'",
-      ],
+      ["/bin/sh", "-c", launchdPythonCmd],
       { env: resolverEnv },
     );
     if (launchdPython.code === 0) {
-      pass(`launchd PATH resolves python3: ${launchdPython.stdout.trim().replace(/\n/g, " ")}`);
+      pass(`${pinnedPython ? "RELAY_PYTHON" : "launchd PATH"} resolves python3: ${launchdPython.stdout.trim().replace(/\n/g, " ")}`);
     } else {
-      fail(`launchd PATH cannot resolve python3 from ${launchdPath}`);
+      fail(pinnedPython
+        ? `RELAY_PYTHON=${pinnedPython} is not executable or not found`
+        : `launchd PATH cannot resolve python3 from ${launchdPath}`);
     }
 
     if (existsSync(resolverPath) && launchdPython.code === 0) {
-      const compile = await runCommand(["python3", "-m", "py_compile", resolverPath], {
+      const compile = await runCommand([effectivePython, "-m", "py_compile", resolverPath], {
         cwd: PROJECT_ROOT,
         env: resolverEnv,
       });
       compile.code === 0
-        ? pass("Contact resolver compiles with launchd python3")
-        : fail(`Contact resolver does not compile with launchd python3: ${(compile.stderr || compile.stdout).trim()}`);
+        ? pass(`Contact resolver compiles with ${effectivePython}`)
+        : fail(`Contact resolver does not compile with ${effectivePython}: ${(compile.stderr || compile.stdout).trim()}`);
 
       const directResolution = await runCommand(
-        ["python3", resolverPath, "+15555550123"],
+        [effectivePython, resolverPath, "+15555550123"],
         { cwd: PROJECT_ROOT, env: resolverEnv },
       );
       directResolution.code === 0 && directResolution.stdout.trim() === "+15555550123"

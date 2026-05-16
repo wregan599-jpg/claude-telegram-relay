@@ -34,6 +34,10 @@ fi
 RECIPIENT="$1"
 LIMIT="${2:-20}"
 
+# Pin the Python interpreter. Set RELAY_PYTHON in .env to match the interpreter
+# that launchd will actually find (may differ from the interactive shell's python3).
+PYTHON3="${RELAY_PYTHON:-python3}"
+
 if ! [[ "$LIMIT" =~ ^[0-9]+$ ]]; then
   echo "error: LIMIT must be a positive integer" >&2
   exit 64
@@ -63,8 +67,8 @@ sql_string() {
 
 json_string() {
   local s="$1"
-  if command -v python3 >/dev/null 2>&1; then
-    JSON_VALUE="$s" python3 - <<'PY'
+  if command -v "$PYTHON3" >/dev/null 2>&1; then
+    JSON_VALUE="$s" "$PYTHON3" - <<'PY'
 import json
 import os
 print(json.dumps(os.environ["JSON_VALUE"]), end="")
@@ -206,24 +210,24 @@ resolve_recipient() {
     echo "error: contact resolver missing: $resolver" >&2
     return 66
   fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "error: python3 not found; required for contact aliases in $resolver" >&2
+  if ! command -v "$PYTHON3" >/dev/null 2>&1; then
+    echo "error: python3 not found (RELAY_PYTHON=${RELAY_PYTHON:-unset}); required for contact aliases in $resolver" >&2
     return 66
   fi
-  if ! python3 - <<'PY' >/dev/null 2>&1
+  if ! "$PYTHON3" - <<'PY' >/dev/null 2>&1
 import sys
 raise SystemExit(0 if sys.version_info >= (3, 7) else 1)
 PY
   then
     local version
-    version="$(python3 --version 2>&1 || true)"
-    echo "error: python3 >= 3.7 required for $resolver; got ${version:-unknown}" >&2
+    version="$("$PYTHON3" --version 2>&1 || true)"
+    echo "error: python3 >= 3.7 required for $resolver; got ${version:-unknown} (RELAY_PYTHON=${RELAY_PYTHON:-unset})" >&2
     return 66
   fi
 
   local contact err_file
   err_file="$(mktemp "${TMPDIR:-/tmp}/resolve-contact.XXXXXX")"
-  if contact="$(python3 "$resolver" "$input" 2>"$err_file")"; then
+  if contact="$("$PYTHON3" "$resolver" "$input" 2>"$err_file")"; then
     rm -f "$err_file"
     if [[ -n "$contact" ]]; then
       printf "%s" "$contact"
