@@ -14,6 +14,7 @@ import {
   DEFAULT_SHORTCUT_NAME,
   defaultICloudDriveDraftDir,
   ICLOUD_DRIVE_DRAFT_FILE_NAME,
+  isCloudDocsDraftDir,
 } from "../src/icloud-drive-draft.ts";
 import {
   readInstalledShortcutActions,
@@ -142,6 +143,21 @@ async function main() {
     pass(`User ID: ${userId}`);
   }
 
+  // Check for competing official Telegram plugin.
+  // If ~/.claude/channels/telegram/.env exists the plugin may be configured
+  // to poll the same bot token, causing 409 getUpdates crash loops.
+  // Do NOT print file contents — it may contain the bot token.
+  const claudePluginEnvPath = join(homedir(), ".claude", "channels", "telegram", ".env");
+  if (existsSync(claudePluginEnvPath)) {
+    fail(
+      `Claude Telegram plugin config found at ${claudePluginEnvPath}. ` +
+      "If it shares this bot token it will cause 409 getUpdates conflicts. " +
+      `Disable it: mv ${claudePluginEnvPath} ${claudePluginEnvPath}.disabled-$(date +%Y-%m-%d)`,
+    );
+  } else {
+    pass("No competing Claude Telegram plugin config found");
+  }
+
   // 3. Supabase
   console.log(`\n${bold("  Supabase")}`);
   const supaUrl = env.SUPABASE_URL || "";
@@ -219,9 +235,13 @@ async function main() {
       ICLOUD_DRIVE_DRAFT_FILE_NAME,
     );
 
-    draftDir.includes("iCloud~is~workflow~my~workflows")
-      ? fail("RELAY_ICLOUD_DRAFT_DIR points at the non-syncing Shortcuts container")
-      : pass("Relay iCloud draft dir avoids the Shortcuts container");
+    if (!isCloudDocsDraftDir(draftDir, iCloudDriveRoot)) {
+      fail(`RELAY_ICLOUD_DRAFT_DIR must be inside the CloudDocs iCloud Drive root: ${iCloudDriveRoot}`);
+    } else if (draftDir.includes("iCloud~is~workflow~my~workflows")) {
+      fail("RELAY_ICLOUD_DRAFT_DIR points at the non-syncing Shortcuts container");
+    } else {
+      pass("Relay iCloud draft dir targets the CloudDocs iCloud Drive container");
+    }
 
     existsSync(draftPath)
       ? pass(`Latest iCloud draft exists: ${draftPath}`)

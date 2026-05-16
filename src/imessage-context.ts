@@ -72,13 +72,20 @@ function detectPlacementSuppression(message: string): boolean {
 }
 
 const DRAFT_VERB_RE = /\b(draft|write|compose|send|shoot|text|message|respond|reply|ping)\b/;
-const MESSAGE_TYPE_RE = /\b(imessage|imessages|text\s+messages?|texts?|sms|message|messages|chat\s+message)\b/;
+const MESSAGE_TYPE_RE = /\b(imessage|imessages|text\s+messages?|texts?|sms|message|messages|chat\s+message|reply|response)\b/;
 const CONTEXT_SIGNAL_RE = /\b(last|recent|previous|prior|context|history|go\s+through|look\s+through|read\s+(?:my|our|the))\b/;
 // "Respond to Conor saying hi" and "Reply to Conor" clearly mean iMessage —
 // no explicit "message" type keyword is required. We still defer to an email
 // keyword to avoid hijacking "respond to John's email".
-const IMPLICIT_MESSAGE_VERB_RE = /\b(respond|reply|ping)\s+to\b/;
+// Allow only the known "back to" filler so "respond back to" and
+// "reply back to" fire the same draft path as "respond to" / "reply to".
+// Do not accept arbitrary words here: "reply all to" is an email idiom, not
+// an iMessage placement request.
+// Live failure 2026-05-14: "Please respond back to my mom" returned null
+// because "respond back to" didn't satisfy the bare `\s+to` pattern.
+const IMPLICIT_MESSAGE_VERB_RE = /\b(respond|reply|ping)\s+(?:(?:right\s+)?back\s+)?to\b/;
 const EMAIL_TYPE_RE = /\b(email|e-mail|gmail|inbox|mailbox)\b/;
+const EMAIL_REPLY_ALL_RE = /\breply(?:\s*-\s*|\s+)all(?:\s+(?:right\s+)?back)?\s+to\b/;
 
 // Past-tense / meta references to a prior draft. Live failure 2026-05-13T00:14Z:
 // "In your draft to Peggy did not not ready through her previous text messages
@@ -89,9 +96,11 @@ const EMAIL_TYPE_RE = /\b(email|e-mail|gmail|inbox|mailbox)\b/;
 // box" (placement phrasing, no recipient indicator) does not match.
 const PAST_DRAFT_REFERENCE_RE =
   /\b(?:your|the|that|this|my|our|his|her|their|last|previous|previously|earlier|prior)\s+(?:draft|message|reply|response|text|imessage|sms|email|note)\s+(?:to|for|with|about)\b/i;
+const META_DRAFT_QUESTION_RE =
+  /\b(?:did|have|has|had)\s+(?:you|we|i|it|claude|codex|assistant|the\s+(?:bot|relay|assistant))\s+(?:already\s+)?(?:draft|drafted|write|wrote|written|compose|composed|send|sent|shoot|shot|text|texted|message|messaged)\s+(?:(?:a|an|the|that|this|my|your|our|his|her|their|last|previous|earlier|prior)\s+)?(?:draft|message|reply|response|text|imessage|sms|email|note)\s+(?:to|for|with|about)\b/i;
 
 function isPastDraftReference(message: string): boolean {
-  return PAST_DRAFT_REFERENCE_RE.test(message);
+  return PAST_DRAFT_REFERENCE_RE.test(message) || META_DRAFT_QUESTION_RE.test(message);
 }
 
 // Self-recipient: "Reply to myself saying X", "Draft a message to me",
@@ -107,10 +116,18 @@ const SELF_RECIPIENT_RE =
 const SELF_DRAFT_INTENT_RE =
   /\b(?:[Rr]eply|[Rr]espond)\s+to\s+(?:myself|me)\b|\b(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:myself|me)\b|\b(?:[Dd]raft|[Ww]rite|[Cc]ompose|[Ss]end|[Ss]hoot)\s+(?:myself|me)\s+(?:a|an)\s+(?:imessage|text|sms|message)\b|\b(?:[Dd]raft|[Ww]rite|[Cc]ompose|[Ss]end|[Ss]hoot)\s+(?:a|an)\s+(?:imessage|text|sms|message)\s+(?:to|for|with)\s+(?:myself|me)\b/;
 export const SELF_CONTACT = "myself";
+// "to mom", "to my mom", "for my dad", "text my sister", etc.
+// The possessive prefix (my/our/the) is made optional so bare "to mom"
+// also fires — "my mom" was caught but "to mom" slipped through before.
+const RELATIONSHIP_CONTACT_RE =
+  /\b(?:[Ww]ith|[Tt]o|[Ff]or)\s+(?:(?:my|our|the)\s+)?(mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b|\b(?:[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:(?:my|our|the)\s+)?(mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b/;
+const MULTI_RELATIONSHIP_CONTACT_RE =
+  /\b(?:[Ww]ith|[Tt]o|[Ff]or|[Tt]ext|[Mm]essage|[Pp]ing)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\s+(?:and|&)\s+(?:(?:my|our|the)\s+)?(?:mom|mum|mother|dad|father|wife|husband|son|daughter|brother|sister|parent|parents)\b/;
 
 function hasDraftVerbAndType(message: string): boolean {
   const m = message.toLowerCase();
   if (EMAIL_TYPE_RE.test(m)) return false;
+  if (EMAIL_REPLY_ALL_RE.test(m)) return false;
   // Suppress when the message references a prior draft — meta-question, not
   // a new draft request. Critical: this runs BEFORE the implicit-verb path
   // so "in your reply to Peggy did you..." doesn't get hijacked by the
@@ -140,6 +157,13 @@ function cleanContact(raw: string): string {
     .replace(/[,.!?;:]+$/g, "")
     .replace(/\s+(for|about|letting|saying|telling)\b.*$/i, "")
     .trim();
+}
+
+function normalizeRelationshipContact(raw: string): string {
+  const contact = raw.toLowerCase();
+  if (contact === "mum" || contact === "mother") return "mom";
+  if (contact === "father") return "dad";
+  return contact;
 }
 
 function cleanDirectDraftBody(raw: string): string | undefined {
@@ -221,6 +245,7 @@ export function extractIMessageDraftRequest(
   message: string,
 ): IMessageDraftRequest | null {
   if (!hasDraftVerbAndType(message)) return null;
+  if (MULTI_RELATIONSHIP_CONTACT_RE.test(message)) return null;
 
   // Self-recipient first: "Reply to myself saying X" must not require a
   // proper-noun match to count. See SELF_RECIPIENT_RE comment above.
@@ -240,12 +265,15 @@ export function extractIMessageDraftRequest(
   // "Nono it needs to be in my iMessages compose box" to capture "be in my"
   // as a three-word "proper noun" — case-insensitive [A-Z] matches lowercase.
   // The email branch stays case-insensitive via explicit [A-Za-z].
-  const explicit = message.match(
+  const relationship = message.match(RELATIONSHIP_CONTACT_RE);
+  const explicit = relationship ? null : message.match(
     /\b(?:[Ww]ith|[Tt]o)\s+([+()\-\d\s]{7,}|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}|[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b/,
   );
-  if (!explicit) return null;
+  if (!explicit && !relationship) return null;
 
-  const contact = cleanContact(explicit[1]);
+  const contact = explicit
+    ? cleanContact(explicit[1])
+    : normalizeRelationshipContact(relationship![1] || relationship![2]);
   if (!contact) return null;
 
   const m = message.toLowerCase();
@@ -383,7 +411,7 @@ export function renderIMessageContext(result: IMessageContextResult): string {
   if (result.status === "empty") {
     return [
       `IMESSAGE CONTEXT LOOKUP FOR ${request.contact}: no matching messages were found.`,
-      "Full Disk Access worked, but the contact name or identifier did not match a Messages thread. Ask the user for the phone number or email if needed.",
+      "Full Disk Access worked but the contact name did not match a Messages thread. Draft from the user's description without asking clarifying questions.",
     ].join("\n");
   }
 

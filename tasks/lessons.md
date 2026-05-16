@@ -1412,3 +1412,46 @@
 **Fix:** Wrapped all of chain 3 in `if (placement !== undefined)`. `placement` is only assigned in chain 2's `else` branch, which runs only when both iPhone mirror and iCloud Drive failed. The guard makes the invariant structural rather than relying on `!handoff?.ok` being redundantly true.
 
 **Pattern to watch:** Any time a status variable is set in one if-branch and an independent if-chain runs afterward with a broader condition (`!x` where `x` is false in a successful sibling branch), the successful branch's state can be silently overwritten. Always gate follow-up chains on the concrete evidence of what happened (the assigned variable), not on the absence of a prior failure flag.
+
+## 2026-05-16 — Live relay audit: launchd, Telegram polling, and phone handoff boundaries
+
+- Live relay logs showed repeated `GrammyError ... getUpdates ... 409:
+  Conflict: terminated by other getUpdates request` followed by launchd
+  restarts. The local `bot.lock` only protects one `RELAY_DIR`; it cannot
+  prove token-level exclusivity across another process, machine, or tool using
+  the same Telegram bot token. The relay must treat Telegram 409 long-polling
+  conflicts as a runtime contention state: stay alive, log the competing
+  poller signal, and retry with bounded backoff instead of crashing into a
+  KeepAlive loop.
+- First local 409 check: `ps ... | rg telegram/0.0.6` and
+  `~/.claude/channels/telegram/.env`. The official Claude Telegram plugin can
+  respawn from Cursor/Claude even when no launchd service exists. Disable its
+  token file by moving `.env` aside without printing the token, then stop the
+  plugin process. If 409s persist after one Telegram long-poll timeout window,
+  suspect another machine or remote process using the same bot token.
+- Launchd's generated PATH omitted `/usr/sbin`, so the architecture preflight
+  could not find `sysctl` even though the check was diagnostic-only. Runtime
+  probes that call system tools should use absolute paths (`/usr/bin/file`,
+  `/usr/sbin/sysctl`) or the generated launchd PATH must include the needed
+  system directories. Do not rely on Terminal's interactive PATH to validate a
+  launchd service.
+- Phone handoff details are internal relay state, not Telegram UX. A successful
+  CloudDocs write means `latest.json` is ready for the iPhone Shortcut; it does
+  not mean Telegram should show `shortcuts://...` or an "Open on iPhone" line.
+  Telegram replies should show the draft body. Keep `shortcutUrl`, handoff path,
+  and body hash in decision logs for debugging.
+- `writeICloudDriveDraft` must reject draft directories outside
+  `~/Library/Mobile Documents/com~apple~CloudDocs` at runtime. `setup:verify`
+  catching a bad `RELAY_ICLOUD_DRAFT_DIR` is not enough because old launchd
+  env, manual runs, or future code paths can still call the writer directly.
+  Never mark `phone_handoff_ready` for a local temp dir or the non-syncing
+  Shortcuts container.
+- Shortcut validation must verify the file provider identity, not just action
+  order and relative paths. The Get File bookmark should have
+  `WFFileLocationType=iCloud` and a CloudDocs
+  `fileProviderDomainID`; otherwise a path string that looks right can still
+  point at a provider the iPhone Shortcut cannot read.
+- Multi-recipient relationship phrasing such as `mom and dad` must not silently
+  choose the first relationship contact. Until the relay has real group-thread
+  support, opt out of one-contact automation rather than drafting to only one
+  person.

@@ -37,12 +37,16 @@ export function getBinaryArch(binaryPath: string): BinaryArch {
 }
 
 /**
- * Runs `sysctl -n sysctl.proc_translated`. Returns true when the
+ * Runs `/usr/sbin/sysctl -n sysctl.proc_translated`. Returns true when the
  * current process is running under Rosetta. SYNCHRONOUS.
+ *
+ * launchd agents commonly run with a narrow PATH that excludes /usr/sbin.
+ * Keep this absolute like the /usr/bin/file probe above so preflight behavior
+ * does not depend on Terminal's interactive shell environment.
  */
 export function isRosettaProcess(): boolean {
   const result = Bun.spawnSync({
-    cmd: ["sysctl", "-n", "sysctl.proc_translated"],
+    cmd: ["/usr/sbin/sysctl", "-n", "sysctl.proc_translated"],
     stdout: "pipe",
     stderr: "pipe",
   });

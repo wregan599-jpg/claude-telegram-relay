@@ -1,13 +1,19 @@
 import { expect, test } from "bun:test";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "fs/promises";
+import { tmpdir } from "os";
+import { dirname, join } from "path";
 import {
   DRAFT_MARKER_CLOSE,
   DRAFT_MARKER_OPEN,
   NEW_COMPOSE_SENTINEL,
   extractDraftBody,
+  formatPhoneHandoffForTelegram,
   rebuildAroundDraftBlock,
   replaceDraftBlock,
   stripPlacementClaims,
 } from "./imessage-draft";
+
+const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
 const wrap = (body: string) =>
   `Here's the draft for Peggy:\n\n${DRAFT_MARKER_OPEN}\n${body}\n${DRAFT_MARKER_CLOSE}\n`;
@@ -190,6 +196,31 @@ test("stripPlacementClaims preserves legitimate body lines that mention 'send'",
   expect(stripPlacementClaims(input)).toBe(input);
 });
 
+test("stripPlacementClaims removes Claude refusal-plus-draft footers (regression 2026-05-15)", () => {
+  // Live failure uid=814654418: user said "Unacceptable response", Claude replied
+  // with "I do not have the ability to send messages on your behalf…" preamble +
+  // the draft body + "You'll need to send this directly through your Messages app"
+  // footer. stripPlacementClaims must extract only the draft body.
+  const input = [
+    "I do not have the ability to send messages on your behalf - I can only help you draft messages. Here's what you could send:",
+    "",
+    "heading to London",
+    "",
+    "You'll need to send this directly through your Messages app or another messaging platform.",
+  ].join("\n");
+  expect(stripPlacementClaims(input).trim()).toBe("heading to London");
+
+  // "I don't have…" contraction form
+  const contraction = [
+    "I don't have the ability to send messages on your behalf.",
+    "",
+    "Draft body here.",
+    "",
+    "You'll need to send this directly through your Messages app.",
+  ].join("\n");
+  expect(stripPlacementClaims(contraction).trim()).toBe("Draft body here.");
+});
+
 test("stripPlacementClaims preserves placement-like lines inside draft markers", () => {
   const input = [
     "Lead.",
@@ -210,4 +241,110 @@ test("NEW_COMPOSE_SENTINEL is the documented '?' character", () => {
   // Keeping this in lockstep with scripts/draft-imessage.sh's is_blank_sentinel.
   // If you change this constant, update the script's recognized sentinels.
   expect(NEW_COMPOSE_SENTINEL).toBe("?");
+});
+
+test("phone handoff formatting keeps Shortcuts handoff Telegram-safe", () => {
+  const formatted = formatPhoneHandoffForTelegram(
+    "Here's the draft for Mark:\n\nHey Mark, sounds good.\n\nPhone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft\n",
+  );
+
+  expect(formatted).toBe(
+    "Here's the draft for Mark:\n\nHey Mark, sounds good.",
+  );
+  expect(formatted).not.toContain("Phone handoff ready:");
+  expect(formatted).not.toContain("shortcuts://run-shortcut?name=ClaudeDraft");
+});
+
+test("phone handoff formatting returns only fallback when no draft text remains", () => {
+  expect(
+    formatPhoneHandoffForTelegram(
+      "Phone handoff ready: shortcuts://run-shortcut?name=ClaudeDraft",
+    ),
+  ).toBe("Run ClaudeDraft in Shortcuts on your iPhone.");
+});
+
+test("phone handoff formatting leaves ordinary chatbot draft text alone", () => {
+  const visible = "Draft ready.\n\nheading to London";
+
+  expect(formatPhoneHandoffForTelegram(visible)).toBe(visible);
+});
+
+async function runDraftHelper(recipient: string, body: string) {
+  const dir = await mkdtemp(join(tmpdir(), "draft-imessage-helper-"));
+  const openLog = join(dir, "open.log");
+  const clipboardLog = join(dir, "clipboard.txt");
+  const fakeOpen = join(dir, "fake-open.sh");
+  const fakePbcopy = join(dir, "fake-pbcopy.sh");
+
+  await writeFile(
+    fakeOpen,
+    "#!/usr/bin/env bash\nprintf '%s\\n' \"$1\" >> \"$RELAY_FAKE_OPEN_LOG\"\n",
+  );
+  await writeFile(
+    fakePbcopy,
+    "#!/usr/bin/env bash\ncat > \"$RELAY_FAKE_CLIPBOARD_LOG\"\n",
+  );
+  await chmod(fakeOpen, 0o700);
+  await chmod(fakePbcopy, 0o700);
+
+  try {
+    const proc = Bun.spawn(
+      [join(PROJECT_ROOT, "scripts", "draft-imessage.sh"), recipient],
+      {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+        env: {
+          ...process.env,
+          RELAY_OPEN_CMD: fakeOpen,
+          RELAY_PBCOPY_CMD: fakePbcopy,
+          RELAY_FAKE_OPEN_LOG: openLog,
+          RELAY_FAKE_CLIPBOARD_LOG: clipboardLog,
+        },
+      },
+    );
+    proc.stdin?.write(body);
+    await proc.stdin?.end();
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return {
+      code,
+      stdout,
+      stderr,
+      openLog: await readFile(openLog, "utf8").catch(() => ""),
+      clipboard: await readFile(clipboardLog, "utf8").catch(() => ""),
+    };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+test("draft helper treats NEW_COMPOSE_SENTINEL as unverified blank-recipient compose", async () => {
+  const result = await runDraftHelper(NEW_COMPOSE_SENTINEL, "Hello world");
+
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout)).toEqual({
+    ok: true,
+    recipient: NEW_COMPOSE_SENTINEL,
+    mode: "clipboard_only",
+    reason: "sms_body_url_opened_unverified_new_compose",
+  });
+  expect(result.openLog.trim()).toBe("sms:&body=Hello%20world");
+  expect(result.clipboard).toBe("Hello world");
+});
+
+test("draft helper emits JSON-safe recipient values", async () => {
+  const result = await runDraftHelper('a"b@example.com', "Hi");
+
+  expect(result.code).toBe(0);
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    ok: true,
+    recipient: 'a"b@example.com',
+    mode: "clipboard_only",
+    reason: "sms_body_url_opened_unverified",
+  });
+  expect(result.openLog.trim()).toBe("sms:a%22b@example.com&body=Hi");
 });

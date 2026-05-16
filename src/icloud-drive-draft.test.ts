@@ -1,9 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, stat } from "fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 import {
+  defaultICloudDriveRoot,
   defaultICloudDriveDraftDir,
+  isCloudDocsDraftDir,
+  shortcutInstallPath,
   shortcutRunUrl,
   writeICloudDriveDraft,
 } from "./icloud-drive-draft";
@@ -14,6 +17,10 @@ async function tempDraftDir(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "relay-icloud-drive-draft-"));
   tmpRoots.push(root);
   return join(root, "claude-relay-drafts");
+}
+
+function tempCloudDocsRootFor(dir: string): string {
+  return dirname(dir);
 }
 
 afterEach(async () => {
@@ -30,6 +37,7 @@ test("writes latest.json with recipient, body, timestamp, and body hash", async 
     },
     {
       dir,
+      cloudDocsRoot: tempCloudDocsRootFor(dir),
       now: new Date("2026-05-13T13:30:00.000Z"),
       shortcutName: "ClaudeDraft",
     },
@@ -54,11 +62,11 @@ test("atomically replaces latest.json on subsequent writes", async () => {
   const dir = await tempDraftDir();
   const first = await writeICloudDriveDraft(
     { recipient: "+1", recipientLabel: "First", body: "first body" },
-    { dir, now: new Date("2026-05-13T13:30:00.000Z") },
+    { dir, cloudDocsRoot: tempCloudDocsRootFor(dir), now: new Date("2026-05-13T13:30:00.000Z") },
   );
   const second = await writeICloudDriveDraft(
     { recipient: "+2", recipientLabel: "Second", body: "second body" },
-    { dir, now: new Date("2026-05-13T13:31:00.000Z") },
+    { dir, cloudDocsRoot: tempCloudDocsRootFor(dir), now: new Date("2026-05-13T13:31:00.000Z") },
   );
 
   expect(first.ok).toBe(true);
@@ -77,10 +85,40 @@ test("refuses when the handoff root is absent", async () => {
     recipient: "+15198545324",
     recipientLabel: "William",
     body: "body",
-  }, { dir });
+  }, { dir, cloudDocsRoot: dirname(dir) });
 
   expect(result.ok).toBe(false);
   expect(result.error).toContain(`icloud_drive_root_missing:${dirname(dir)}`);
+});
+
+test("refuses draft directories outside the CloudDocs root", async () => {
+  const dir = await tempDraftDir();
+
+  const result = await writeICloudDriveDraft({
+    recipient: "+15198545324",
+    recipientLabel: "William",
+    body: "body",
+  }, { dir });
+
+  expect(result.ok).toBe(false);
+  expect(result.error).toBe(`icloud_drive_draft_dir_not_clouddocs:${dir}`);
+  expect(isCloudDocsDraftDir(dir)).toBe(false);
+});
+
+test("returns ok false instead of throwing when draft directory cannot be created", async () => {
+  const root = await mkdtemp(join(tmpdir(), "relay-blocked-icloud-dir-"));
+  tmpRoots.push(root);
+  const dir = join(root, "claude-relay-drafts");
+  await writeFile(dir, "not a directory", "utf8");
+
+  const result = await writeICloudDriveDraft({
+    recipient: "+15198545324",
+    recipientLabel: "William",
+    body: "body",
+  }, { dir, cloudDocsRoot: tempCloudDocsRootFor(dir) });
+
+  expect(result.ok).toBe(false);
+  expect(result.error).toBeTruthy();
 });
 
 test("shortcutRunUrl URL-encodes custom shortcut names", () => {
@@ -89,12 +127,12 @@ test("shortcutRunUrl URL-encodes custom shortcut names", () => {
   );
 });
 
-test("default handoff dir targets the Shortcuts iCloud container", () => {
+test("default handoff dir targets the iCloud Drive container", () => {
   const original = process.env.RELAY_ICLOUD_DRAFT_DIR;
   delete process.env.RELAY_ICLOUD_DRAFT_DIR;
   try {
     expect(defaultICloudDriveDraftDir()).toContain(
-      "Library/Mobile Documents/iCloud~is~workflow~my~workflows/Documents/claude-relay-drafts",
+      "Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts",
     );
   } finally {
     if (original === undefined) {
@@ -105,13 +143,22 @@ test("default handoff dir targets the Shortcuts iCloud container", () => {
   }
 });
 
+test("shortcut install path uses the iCloud Drive root and exact shortcut filename", () => {
+  expect(defaultICloudDriveRoot()).toContain(
+    "Library/Mobile Documents/com~apple~CloudDocs",
+  );
+  expect(shortcutInstallPath("ClaudeDraft")).toBe(
+    join(defaultICloudDriveRoot(), "ClaudeDraft.shortcut"),
+  );
+});
+
 test("latest.json is owner-readable only on write", async () => {
   const dir = await tempDraftDir();
   const result = await writeICloudDriveDraft({
     recipient: "+15198545324",
     recipientLabel: "William",
     body: "body",
-  }, { dir });
+  }, { dir, cloudDocsRoot: tempCloudDocsRootFor(dir) });
 
   expect(result.ok).toBe(true);
   const mode = (await stat(join(dir, "latest.json"))).mode & 0o777;

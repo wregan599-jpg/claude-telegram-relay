@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from "crypto";
 import { chmod, mkdir, open, rename, stat, unlink } from "fs/promises";
 import { homedir } from "os";
-import { dirname, join } from "path";
+import { join, resolve, sep } from "path";
 
 export const DEFAULT_SHORTCUT_NAME = "ClaudeDraft";
+export const ICLOUD_DRIVE_DRAFT_FILE_NAME = "latest.json";
 
 export interface ICloudDriveDraftInput {
   recipient: string;
@@ -25,10 +26,33 @@ export function defaultICloudDriveDraftDir(): string {
       homedir(),
       "Library",
       "Mobile Documents",
-      "iCloud~is~workflow~my~workflows",
-      "Documents",
+      "com~apple~CloudDocs",
       "claude-relay-drafts",
     );
+}
+
+export function defaultICloudDriveRoot(): string {
+  return join(
+    homedir(),
+    "Library",
+    "Mobile Documents",
+    "com~apple~CloudDocs",
+  );
+}
+
+export function isCloudDocsDraftDir(
+  dir: string,
+  cloudDocsRoot = defaultICloudDriveRoot(),
+): boolean {
+  const root = resolve(cloudDocsRoot);
+  const candidate = resolve(dir);
+  return candidate === root || candidate.startsWith(`${root}${sep}`);
+}
+
+export function shortcutInstallPath(
+  shortcutName = process.env.RELAY_IMESSAGE_SHORTCUT_NAME ?? DEFAULT_SHORTCUT_NAME,
+): string {
+  return join(defaultICloudDriveRoot(), `${shortcutName}.shortcut`);
 }
 
 export function shortcutRunUrl(
@@ -39,10 +63,14 @@ export function shortcutRunUrl(
 
 export async function writeICloudDriveDraft(
   input: ICloudDriveDraftInput,
-  options: { dir?: string; now?: Date; shortcutName?: string } = {},
+  options: { dir?: string; now?: Date; shortcutName?: string; cloudDocsRoot?: string } = {},
 ): Promise<ICloudDriveDraftResult> {
   const dir = options.dir ?? defaultICloudDriveDraftDir();
-  const cloudDocsRoot = dirname(dir);
+  const cloudDocsRoot = options.cloudDocsRoot ?? defaultICloudDriveRoot();
+
+  if (!isCloudDocsDraftDir(dir, cloudDocsRoot)) {
+    return { ok: false, error: `icloud_drive_draft_dir_not_clouddocs:${dir}` };
+  }
 
   try {
     const rootStats = await stat(cloudDocsRoot);
@@ -62,7 +90,7 @@ export async function writeICloudDriveDraft(
     body_sha256: bodySha256,
   };
 
-  const target = join(dir, "latest.json");
+  const target = join(dir, ICLOUD_DRIVE_DRAFT_FILE_NAME);
   const tmp = join(dir, `.tmp-${process.pid}-${Date.now()}-${randomUUID()}.json`);
 
   let handle: Awaited<ReturnType<typeof open>> | null = null;

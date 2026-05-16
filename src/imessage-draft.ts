@@ -17,6 +17,8 @@ export const DRAFT_MARKER_CLOSE = "<<<END_IMESSAGE_DRAFT>>>";
 const DRAFT_BLOCK_RE = /<<<IMESSAGE_DRAFT>>>([\s\S]*?)<<<END_IMESSAGE_DRAFT>>>/;
 const ORPHAN_MARKER_RE = /<<<\/?(?:END_)?IMESSAGE_DRAFT>>>/g;
 const HELPER_TIMEOUT_MS = 25_000;
+const PHONE_HANDOFF_LINE_RE =
+  /\n*[ \t]*Phone handoff ready:\s*(shortcuts:\/\/run-shortcut\?name=[^\s]+)\s*\n*/i;
 
 // Claude likes to append boilerplate after a draft: "Draft is in the Messages
 // compose box for X. Review and send when ready." or "Draft above, review
@@ -44,6 +46,15 @@ const PLACEMENT_CLAIM_LINE_RES: RegExp[] = [
   /^[ \t]*you[^\n]*\bsend\s+(?:it|this|that|the\s+draft|the\s+message|messages?)\s+(?:manually|yourself|when\s+(?:you'?re\s+)?ready|from\s+messages)\b[^\n]*\n?/gim,
   /^[ \t]*send\s+(?:it|this|the\s+draft|that|the\s+message)\s+(?:manually|yourself|when\s+you'?re\s+ready)[^\n]*\n?/gim,
   /^[ \t]*(?:i\s+can(?:'t|not)|i\s+won'?t|i\s+do\s+not|i\s+cannot)\s+send\s+(?:it|this|that|the\s+(?:draft|message|imessage|email)|messages?|for\s+you)[^\n]*\n?/gim,
+  // "I don't/do not have the ability to send messages on your behalf" — relay prompt
+  // covers this, but Claude still outputs it when users complain about the draft flow.
+  /^[ \t]*i\s+(?:don'?t|do\s+not)\s+have\s+(?:the\s+)?(?:ability|permission|access|capability)\s+to\s+send[^\n]*\n?/gim,
+  // "You'll need to send this directly through your Messages app / another messaging platform."
+  // Escapes stripPlacementClaims because it uses "directly through" rather than
+  // "manually/yourself/from messages". Hard-banned: the relay owns placement status.
+  /^[ \t]*you'?ll\s+need\s+to\s+send\s+(?:this|it|that|the\s+(?:draft|message))[^\n]*\n?/gim,
+  // "Send this through your Messages app or another messaging platform."
+  /^[ \t]*send\s+(?:this|it|that|the\s+(?:draft|message))\s+(?:through|via|using|directly)[^\n]*\n?/gim,
 ];
 
 /**
@@ -76,6 +87,8 @@ export function stripPlacementClaims(text: string): string {
 
 export type IMessageDraftStatus =
   | "placed"
+  | "phone_handoff_ready"
+  | "phone_shortcut_install_pending"
   | "markers_missing"
   | "empty_body"
   | "no_recipient"
@@ -92,10 +105,11 @@ export const NEW_COMPOSE_SENTINEL = "?";
 export interface PlaceDraftResult {
   ok: boolean;
   /**
-   * "pasted" → body is in the Messages compose field of the resolved
-   * recipient's thread via the native sms:RECIPIENT&body= URL path.
-   * "new_compose" → body is in a brand-new Messages compose window with
-   * the recipient field blank (used when contact resolution failed).
+   * "pasted" → a future verified UI path proved the body is in the Messages
+   * compose field. The current helper intentionally does not claim this from
+   * `open sms:...` alone.
+   * "new_compose" → a future verified UI path proved the body is in a
+   * brand-new Messages compose window with the recipient field blank.
    * "clipboard_only" → body is on the clipboard and Messages is open, but
    * the body did not visibly prefill. All three are usable; the relay
    * tells the user which one happened so it never claims compose-box
@@ -156,6 +170,22 @@ export function rebuildAroundDraftBlock(
   }
   const lead = stripPlacementClaims(response.slice(0, m.index)).trim();
   return lead.length > 0 ? `${lead}\n\n${replacement}` : replacement;
+}
+
+/**
+ * Convert the relay's internal iPhone Shortcut handoff line into Telegram-safe
+ * body text. Telegram Bot API rejects custom schemes such as `shortcuts://` in
+ * inline keyboard button URLs, so this must never create reply_markup.
+ */
+export function formatPhoneHandoffForTelegram(response: string): string {
+  const match = response.match(PHONE_HANDOFF_LINE_RE);
+  if (!match) return response;
+
+  const stripped = response.replace(PHONE_HANDOFF_LINE_RE, "\n\n").trim();
+
+  return stripped.length > 0
+    ? stripped
+    : "Run ClaudeDraft in Shortcuts on your iPhone.";
 }
 
 /**

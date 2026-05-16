@@ -72,6 +72,11 @@ import {
   prepareTelegramResponseText,
   sendTelegramResponse,
 } from "./telegram-response.ts";
+import {
+  TELEGRAM_POLLING_CONFLICT_INITIAL_DELAY_MS,
+  isTelegramPollingConflictError,
+  nextTelegramPollingConflictDelayMs,
+} from "./telegram-polling.ts";
 import { getSupabaseFeatureConfig } from "./supabase-config.ts";
 import { checkRelayBinaries, archLabel } from "./arch-check.ts";
 
@@ -1867,8 +1872,35 @@ bot.catch((err) => {
   }
 });
 
-bot.start({
-  onStart: () => {
-    console.log("Bot is running!");
-  },
-});
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function startTelegramPollingWithBackoff(): Promise<void> {
+  let retryDelayMs = TELEGRAM_POLLING_CONFLICT_INITIAL_DELAY_MS;
+
+  for (;;) {
+    try {
+      await bot.start({
+        onStart: () => {
+          console.log("Bot is running!");
+          console.log(
+            `[telegram] long polling owner: claude-telegram-relay pid=${process.pid}`,
+          );
+        },
+      });
+      return;
+    } catch (err) {
+      if (!isTelegramPollingConflictError(err)) throw err;
+
+      console.error(
+        `[bot] Telegram getUpdates conflict; another poller is using this bot token. ` +
+        `Keeping this relay alive and retrying in ${Math.round(retryDelayMs / 1000)}s.`,
+      );
+      await sleep(retryDelayMs);
+      retryDelayMs = nextTelegramPollingConflictDelayMs(retryDelayMs);
+    }
+  }
+}
+
+await startTelegramPollingWithBackoff();

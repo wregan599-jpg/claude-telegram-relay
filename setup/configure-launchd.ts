@@ -7,27 +7,34 @@
  * Usage: bun run setup/configure-launchd.ts [--service relay|checkin|briefing|all]
  */
 
-import { writeFile, readFile } from "fs/promises";
-import { existsSync } from "fs";
+import { writeFile } from "fs/promises";
+import { chmodSync, existsSync, mkdirSync } from "fs";
 import { join, dirname } from "path";
 import { homedir } from "os";
 
 const PROJECT_ROOT = dirname(import.meta.dir);
 const HOME = homedir();
-const USERNAME = HOME.split("/").pop() || "user";
 const LAUNCH_AGENTS = join(HOME, "Library", "LaunchAgents");
-const LOGS_DIR = join(PROJECT_ROOT, "logs");
+const RELAY_DIR = process.env.RELAY_DIR || join(HOME, ".claude-relay");
+const LOGS_DIR = process.env.RELAY_LOG_DIR || join(RELAY_DIR, "logs");
 
 // Colors
 const green = (s: string) => `\x1b[32m${s}\x1b[0m`;
 const red = (s: string) => `\x1b[31m${s}\x1b[0m`;
-const yellow = (s: string) => `\x1b[33m${s}\x1b[0m`;
-const cyan = (s: string) => `\x1b[36m${s}\x1b[0m`;
 const bold = (s: string) => `\x1b[1m${s}\x1b[0m`;
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 
 const PASS = green("✓");
 const FAIL = red("✗");
+
+function xmlEscape(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
 
 // Find bun path
 async function findBun(): Promise<string> {
@@ -52,6 +59,7 @@ function generatePlist(opts: {
   calendarIntervals?: { Hour: number; Minute: number }[];
 }): string {
   const bunPath = findBunSync;
+  const string = (value: string) => `<string>${xmlEscape(value)}</string>`;
 
   let scheduling = "";
   if (opts.calendarIntervals) {
@@ -76,30 +84,30 @@ function generatePlist(opts: {
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>${opts.label}</string>
+    ${string(opts.label)}
 
     <key>ProgramArguments</key>
     <array>
-        <string>${bunPath}</string>
-        <string>run</string>
-        <string>${opts.script}</string>
+        ${string(bunPath)}
+        ${string("run")}
+        ${string(opts.script)}
     </array>
 
     <key>WorkingDirectory</key>
-    <string>${PROJECT_ROOT}</string>
+    ${string(PROJECT_ROOT)}
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
+        ${string(`${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`)}
         <key>HOME</key>
-        <string>${HOME}</string>
+        ${string(HOME)}
         <key>CLAUDE_PATH</key>
-        <string>${HOME}/.local/bin/claude</string>
+        ${string(`${HOME}/.local/bin/claude`)}
         <key>CLAUDE_TIMEOUT_MS</key>
-        <string>90000</string>
+        ${string("90000")}
         <key>CLAUDE_RESUME</key>
-        <string>0</string>
+        ${string("0")}
     </dict>
 ${opts.keepAlive ? `
     <key>RunAtLoad</key>
@@ -112,10 +120,10 @@ ${opts.keepAlive ? `
     <integer>10</integer>
 ` : ""}${scheduling}
     <key>StandardOutPath</key>
-    <string>${LOGS_DIR}/${opts.label}.log</string>
+    ${string(`${LOGS_DIR}/${opts.label}.log`)}
 
     <key>StandardErrorPath</key>
-    <string>${LOGS_DIR}/${opts.label}.error.log</string>
+    ${string(`${LOGS_DIR}/${opts.label}.error.log`)}
 </dict>
 </plist>`;
 }
@@ -160,6 +168,70 @@ const SERVICES: Record<string, ServiceConfig> = {
   },
 };
 
+function isBenignUnloadMiss(stderr: string): boolean {
+  return stderr.includes("Could not find specified service") ||
+    stderr.includes("No such process") ||
+    stderr.includes("service already unloaded");
+}
+
+async function unloadExistingService(
+  config: ServiceConfig,
+  plistPath: string,
+): Promise<boolean> {
+  // `launchctl unload <plist>` only unloads the job registered from that exact
+  // path. Remove by label first so stale jobs loaded from an older plist path
+  // cannot survive and compete for Telegram polling.
+  const remove = Bun.spawn(["launchctl", "remove", config.label], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  await new Response(remove.stderr).text();
+  await remove.exited;
+
+  const unload = Bun.spawn(["launchctl", "unload", plistPath], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const unloadErr = await new Response(unload.stderr).text();
+  const unloadCode = await unload.exited;
+
+  if (unloadCode !== 0 && !isBenignUnloadMiss(unloadErr)) {
+    console.log(`  ${FAIL} Failed to unload ${config.label}: ${unloadErr.trim()}`);
+    return false;
+  }
+
+  const list = Bun.spawn(["launchctl", "list", config.label], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const listCode = await list.exited;
+  if (listCode === 0) {
+    console.log(`  ${FAIL} ${config.label} is still loaded after unload`);
+    return false;
+  }
+
+  return true;
+}
+
+async function lintPlist(plistPath: string): Promise<boolean> {
+  const lint = Bun.spawn(["plutil", "-lint", plistPath], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [lintOut, lintErr, lintCode] = await Promise.all([
+    new Response(lint.stdout).text(),
+    new Response(lint.stderr).text(),
+    lint.exited,
+  ]);
+
+  if (lintCode !== 0) {
+    console.log(`  ${FAIL} Invalid plist: ${(lintErr || lintOut).trim()}`);
+    return false;
+  }
+
+  return true;
+}
+
 async function installService(name: string, config: ServiceConfig): Promise<boolean> {
   const plistPath = join(LAUNCH_AGENTS, `${config.label}.plist`);
 
@@ -168,12 +240,8 @@ async function installService(name: string, config: ServiceConfig): Promise<bool
   await writeFile(plistPath, content);
   console.log(`  ${PASS} Generated ${config.label}.plist`);
 
-  // Unload if already loaded
-  const unload = Bun.spawn(["launchctl", "unload", plistPath], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  await unload.exited;
+  if (!(await lintPlist(plistPath))) return false;
+  if (!(await unloadExistingService(config, plistPath))) return false;
 
   // Load
   const load = Bun.spawn(["launchctl", "load", plistPath], {
@@ -192,6 +260,18 @@ async function installService(name: string, config: ServiceConfig): Promise<bool
   return true;
 }
 
+async function unloadService(config: ServiceConfig): Promise<boolean> {
+  const plistPath = join(LAUNCH_AGENTS, `${config.label}.plist`);
+  if (!existsSync(plistPath)) {
+    console.log(`  ${PASS} ${config.label} not installed`);
+    return true;
+  }
+
+  if (!(await unloadExistingService(config, plistPath))) return false;
+  console.log(`  ${PASS} Unloaded ${config.label}`);
+  return true;
+}
+
 async function main() {
   if (process.platform !== "darwin") {
     console.log(`\n  ${FAIL} This script is for macOS only.`);
@@ -203,6 +283,7 @@ async function main() {
 
   // Parse --service flag
   const args = process.argv.slice(2);
+  const shouldUnload = args.includes("--unload");
   const serviceIdx = args.indexOf("--service");
   const serviceArg = serviceIdx !== -1 ? args[serviceIdx + 1] : "relay";
 
@@ -214,13 +295,32 @@ async function main() {
   console.log(dim(`  Project: ${PROJECT_ROOT}`));
   console.log("");
 
-  // Ensure logs directory exists
-  if (!existsSync(LOGS_DIR)) {
-    const { mkdirSync } = await import("fs");
-    mkdirSync(LOGS_DIR, { recursive: true });
+  let allOk = true;
+  if (shouldUnload) {
+    for (const name of toInstall) {
+      const config = SERVICES[name];
+      if (!config) {
+        console.log(`  ${FAIL} Unknown service: ${name}`);
+        console.log(`      ${dim("Available: relay, checkin, briefing, all")}`);
+        allOk = false;
+        continue;
+      }
+      const ok = await unloadService(config);
+      if (!ok) allOk = false;
+    }
+    console.log("");
+    if (allOk) console.log(`  ${green("Done!")} Requested services are unloaded.`);
+    console.log("");
+    process.exit(allOk ? 0 : 1);
   }
 
-  let allOk = true;
+  // Ensure private launchd log directory exists. These logs can contain local
+  // paths, contact names, and operational errors.
+  if (!existsSync(LOGS_DIR)) {
+    mkdirSync(LOGS_DIR, { recursive: true, mode: 0o700 });
+  }
+  chmodSync(LOGS_DIR, 0o700);
+
   for (const name of toInstall) {
     const config = SERVICES[name];
     if (!config) {
@@ -239,7 +339,7 @@ async function main() {
     console.log("");
     console.log(`  ${dim("Check status:")}  launchctl list | grep com.claude`);
     console.log(`  ${dim("View logs:")}     tail -f ${LOGS_DIR}/com.claude.telegram-relay.log`);
-    console.log(`  ${dim("Stop all:")}      bun run setup/configure-launchd.ts --unload`);
+    console.log(`  ${dim("Stop all:")}      bun run setup/configure-launchd.ts --unload --service all`);
   }
   console.log("");
 }

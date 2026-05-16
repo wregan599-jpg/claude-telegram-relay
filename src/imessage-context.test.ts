@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { dirname, join } from "path";
 import {
   detectIMessageWriteIntent,
   extractIMessageDraftRequest,
@@ -6,6 +7,8 @@ import {
   renderIMessageContext,
   type IMessageContextResult,
 } from "./imessage-context";
+
+const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
 test("extracts contact, context flag, and placement flag from a full context+placement request", () => {
   expect(
@@ -122,6 +125,12 @@ test("possessive-references to prior drafts/messages do not trigger placement", 
     "Did you read context before your draft to Sarah?",
     "Regarding the text to Mom earlier, can you clarify?",
     "On your previous draft to William, what was the tone?",
+    "Did you draft a response to Peggy yesterday?",
+    "Have we sent a reply to Sarah already?",
+    "Did Claude send a response to Peggy?",
+    "Has Claude sent a response to Peggy?",
+    "Did the bot send a response to Peggy?",
+    "Did it send a response to Peggy?",
   ]) {
     expect(extractIMessageDraftRequest(msg)).toBeNull();
   }
@@ -268,6 +277,77 @@ test("vague response requests have no direct body", () => {
   ).toBeUndefined();
 });
 
+test("relationship alias with recent iMessages triggers context-aware draft", () => {
+  expect(
+    extractIMessageDraftRequest(
+      "It should be able to open up my recent imessages with my mom and draft a response back accordingly with our regular rules applying.",
+    ),
+  ).toEqual({
+    contact: "mom",
+    wantsContext: true,
+    contextLimit: 10,
+    wantsPlacement: true,
+  });
+});
+
+test("draft a response back to relationship alias triggers iMessage reply path", () => {
+  expect(
+    extractIMessageDraftRequest("Please draft a response back to my mom"),
+  ).toEqual({
+    contact: "mom",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+  });
+  expect(
+    extractIMessageDraftRequest("Please draft a response back to my mom saying I'll call soon"),
+  ).toEqual({
+    contact: "mom",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "I'll call soon",
+  });
+});
+
+test("relationship aliases work for reply and direct-body drafts", () => {
+  expect(extractIMessageDraftRequest("Reply to my mom")).toEqual({
+    contact: "mom",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+  });
+  expect(extractIMessageDraftRequest("Text my mother saying I'll call soon")).toEqual({
+    contact: "mom",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "I'll call soon",
+  });
+  expect(extractIMessageDraftRequest("Draft a message for my father saying thanks")).toEqual({
+    contact: "dad",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "thanks",
+  });
+});
+
+test("relationship contact wins over proper noun inside direct body", () => {
+  expect(extractIMessageDraftRequest("Text mom saying heading to London")).toEqual({
+    contact: "mom",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "heading to London",
+  });
+});
+
+test("multi-relationship requests do not silently choose one recipient", () => {
+  expect(extractIMessageDraftRequest("Please reply to mom and dad's message")).toBeNull();
+  expect(extractIMessageDraftRequest("Text mom and dad saying hi")).toBeNull();
+});
+
 test("self-recipient still respects placement suppression", () => {
   // "just give me the text" forces wantsPlacement=false even for self drafts.
   const r = extractIMessageDraftRequest(
@@ -349,4 +429,146 @@ test("renders empty lookup as contact mismatch, not FDA failure", () => {
   const rendered = renderIMessageContext(result);
   expect(rendered).toContain("no matching messages");
   expect(rendered).toContain("Full Disk Access worked");
+});
+
+test("imessage-thread helper rejects non-numeric LIMIT before touching chat.db", async () => {
+  const proc = Bun.spawn(
+    [join(PROJECT_ROOT, "scripts", "imessage-thread.sh"), "+15555550123", "1;DROP TABLE message"],
+    {
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env },
+    },
+  );
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+
+  expect(code).toBe(64);
+  expect(stdout).toBe("");
+  expect(stderr).toContain("LIMIT must be a positive integer");
+});
+
+test("contact resolver normalizes formatted AddressBook phone numbers", async () => {
+  const code = `
+import importlib.util
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("resolve_contact", Path("scripts/resolve-contact.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+assert mod.normalize_phone("1 (604) 315-4583") == "+16043154583"
+contacts = [{
+    "name": "Mom",
+    "nickname": "",
+    "org": "",
+    "phone": "1 (604) 315-4583",
+    "phone_primary": 1,
+    "email": "",
+    "email_primary": 0,
+}]
+assert mod.resolve("mom", contacts) == "+16043154583"
+assert mod.resolve("1 (604) 315-4583") == "+16043154583"
+`;
+  const proc = Bun.spawn(["python3", "-c", code], {
+    cwd: PROJECT_ROOT,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, codeResult] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+
+  expect(codeResult).toBe(0);
+  expect(stdout).toBe("");
+  expect(stderr).toBe("");
+});
+
+// -----------------------------------------------------------------------
+// Regression: relational-term contacts (2026-05-14)
+// "mom", "my mom", "my mother", "dad", etc. failed to extract because
+// the proper-noun branch requires [A-Z][a-z]+. The relay returned null,
+// no draft flow fired, and Claude asked "What's the last thing she sent
+// you?" — violating the one-shot rule.
+// -----------------------------------------------------------------------
+
+test("'Please draft an iMessage response to my mom' extracts mom as contact (regression 2026-05-14)", () => {
+  const result = extractIMessageDraftRequest(
+    "Please draft an iMessage response to my mom",
+  );
+  expect(result).not.toBeNull();
+  expect(result?.contact).toBe("mom");
+  expect(result?.wantsPlacement).toBe(true);
+  expect(result?.wantsContext).toBe(false);
+});
+
+test("'draft a message to mom' without possessive still extracts mom (regression 2026-05-14)", () => {
+  const result = extractIMessageDraftRequest("draft a message to mom");
+  expect(result).not.toBeNull();
+  expect(result?.contact).toBe("mom");
+  expect(result?.wantsPlacement).toBe(true);
+});
+
+test("'reply to my dad saying on my way' extracts dad with direct body", () => {
+  const result = extractIMessageDraftRequest(
+    "reply to my dad saying on my way",
+  );
+  expect(result).not.toBeNull();
+  expect(result?.contact).toBe("dad");
+  expect(result?.directBody).toBe("on my way");
+  expect(result?.wantsPlacement).toBe(true);
+});
+
+test("'draft a text to my sister' extracts sister", () => {
+  const result = extractIMessageDraftRequest("draft a text to my sister");
+  expect(result).not.toBeNull();
+  expect(result?.contact).toBe("sister");
+});
+
+test("past-reference 'the text to Mom earlier' still returns null after relational fix", () => {
+  expect(
+    extractIMessageDraftRequest("Regarding the text to Mom earlier, can you clarify?"),
+  ).toBeNull();
+});
+
+test("'mum' normalises to 'mom' and 'mother' also normalises to 'mom'", () => {
+  expect(extractIMessageDraftRequest("draft a message to my mum")?.contact).toBe("mom");
+  expect(extractIMessageDraftRequest("reply to my mother saying thanks")?.contact).toBe("mom");
+});
+
+// Regression: "respond back to" failed because IMPLICIT_MESSAGE_VERB_RE
+// required the verb immediately adjacent to "to". Live failure 2026-05-14:
+// "Please respond back to my mom" returned null — relay treated it as a
+// generic query, Claude asked "What do you want to say to her?" instead of
+// drafting. Fix: allow "back" between verb and "to".
+test("'respond back to' triggers draft path (regression 2026-05-14)", () => {
+  const r = extractIMessageDraftRequest("Please respond back to my mom");
+  expect(r).not.toBeNull();
+  expect(r?.contact).toBe("mom");
+  expect(r?.wantsPlacement).toBe(true);
+});
+
+test("'reply back to Sarah' extracts contact and direct body", () => {
+  const r = extractIMessageDraftRequest("reply back to Sarah saying I am on my way");
+  expect(r).not.toBeNull();
+  expect(r?.contact).toBe("Sarah");
+  expect(r?.directBody).toBe("I am on my way");
+});
+
+test("email guard still fires when back-to phrasing contains email keyword", () => {
+  expect(
+    extractIMessageDraftRequest("respond back to John about his email"),
+  ).toBeNull();
+  expect(
+    extractIMessageDraftRequest("reply all to John saying thanks"),
+  ).toBeNull();
+  expect(
+    extractIMessageDraftRequest("reply-all to John saying thanks"),
+  ).toBeNull();
+  expect(
+    extractIMessageDraftRequest("reply all back to John saying thanks"),
+  ).toBeNull();
 });
