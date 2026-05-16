@@ -23,7 +23,7 @@ echo "Body text" | scripts/draft-email.sh wregan599@gmail.com "Subject line"
 
 Mechanism:
 
-- iMessage draft: the body is copied to your clipboard, then `open imessage://+RECIPIENT` focuses Messages.app on the thread with that contact. You paste with Cmd+V and click send.
+- iMessage draft: the body is copied to your clipboard, then a `sms:<recipient>&body=...` URL opens Messages.app with the body prefilled. If macOS cannot prefill the compose field, the helper falls back to clipboard plus opening Messages.
 - Email draft: the body is URL-encoded into a `mailto:` URL, which opens your default mail client with a new draft pre-filled. The body is also copied to the clipboard as a safety net in case the URL was truncated.
 
 No Full Disk Access, no Automation permission, no Accessibility permission. The bot can call these via its Bash tool at any time.
@@ -43,6 +43,13 @@ The target binary is **`bun`** at its resolved Cellar path — not the Claude CL
    ```
 
    On Apple Silicon + Homebrew this is typically `/opt/homebrew/Cellar/bun/<version>/bin/bun`. On Intel + Homebrew it's `/usr/local/Cellar/bun/<version>/bin/bun`. Always use the resolved Cellar path, never the `/opt/homebrew/bin/bun` or `/usr/local/bin/bun` symlink — symlinks re-point on every `brew upgrade bun` and TCC then silently denies again.
+
+   > **macOS 28 compatibility check:** Rosetta (Intel app translation) ends in macOS 28.
+   > If your `bun` binary is Intel-only, both the FDA grant and the relay itself will
+   > stop working on upgrade. Run `bun run setup/verify.ts` — the "Binary Architecture"
+   > section tells you which binaries are at risk and how to fix them.
+   > To fix an Intel bun: `curl -fsSL https://bun.sh/install | bash` (reinstalls the
+   > Apple silicon native build), then re-grant Full Disk Access to the new path.
 
 2. Open **System Settings → Privacy & Security → Full Disk Access**.
 3. Click the **+** button.
