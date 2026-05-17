@@ -1761,3 +1761,50 @@
 - Also sanitize decoded iMessage text for null/control bytes before injecting
   it into the Claude CLI prompt. Bun refuses spawn args containing null bytes,
   so raw `attributedBody` extraction must never feed `\0` into `callClaude`.
+
+## 2026-05-17 — Architectural decision: keep single-slot handoff, reject queues and IDs
+
+After five iMessage-handoff failures in one session and an open question of whether to replace `latest.json` with draft ids, a queue, or pointer files, Kimi K 2.6 reviewed the architecture in `tasks/telegram-relay-architecture-investigation-prompt-2026-05-17.md` and articulated why the existing minimal design is correct. We are codifying its conclusions as durable architectural rules so a future contributor under bug pressure does not reinvent the draft-id / queue temptation.
+
+### The four principles (decoupling of notification from payload transport)
+
+1. **Telegram is the signal, not the payload.** Telegram delivers "run the ClaudeDraft shortcut now." The body of the draft never travels through Telegram persistence; it travels through iCloud Drive. Embedding the draft body in Telegram (deep links, encoded URIs, inline keyboard data) is rejected — Telegram is the wrong substrate for that.
+2. **iCloud Drive is the synchronization primitive.** `~/Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts/latest.json` is bidirectionally synced by the OS. The relay writes; the iPhone reads when the Shortcut runs. No custom server, no push notifications, no pairing logic.
+3. **Pull-based flow.** The iPhone only pulls when the user runs the Shortcut. That means no race between write and read once the relay's Telegram reply has been delivered, no queueing/history requirement (overwrite is sufficient), and the user is in the right mental context to review.
+4. **The safety contract is one OS toggle.** Show When Run = ON in the Shortcut's Send Message action. That is the entire "never auto-send" guarantee. No custom confirmation dialogs in the chain, no relay-side timer guards, no wrapper logic. The iOS compose sheet IS the human-in-the-loop.
+
+### The open architecture question, resolved
+
+The handover at `tasks/HANDOVER-2026-05-17-late-session-imessage-handoff-reliability.md` listed five "likely better options":
+
+1. `latest.json` as a pointer to an active draft id
+2. `drafts/<draft_id>.json` files
+3. ClaudeDraft consumes the newest unconsumed draft
+4. Archive or delete a draft after ClaudeDraft reads it
+5. Add `request_id`, `draft_id`, `body_sha256` to logs and Telegram replies
+
+Decision: **reject 1, 2, 3, 4. Accept 5 (logging only).**
+
+- Options 1-4 introduce additional state machines, queueing semantics, or consumption protocols. Each is a new failure surface on a substrate (iCloud Drive) the relay does not own. The five failures this session were all fixable inside the single-slot model.
+- Option 5 (additional fields in logs and decision-log JSONL) is observability, not architecture. It does not violate Kimi's principles because it changes nothing the iPhone sees. `body_sha256` is already logged; `request_id` and explicit `draft_id` would be small additions worth doing in a future small PR.
+
+### Known tradeoffs left in place by this decision
+
+These are NOT bugs. They are recorded so the choice is explicit, not implicit.
+
+- **Clear-before-write vs trust-the-overwrite.** `src/relay.ts:942` calls `clearICloudDriveDraft()` whenever `wantsIMessagePlacement` is true, BEFORE Claude generates the new draft. This protects against the "user taps ClaudeDraft during a slow Claude call and sees the stale prior recipient" race. The cost is: when Claude fails to emit draft markers (`markers_missing` path at `src/relay.ts:1126`), the previous valid draft is permanently lost. We accept this tradeoff because the stale-wrong-recipient race is the more dangerous failure (the prior draft is plausible and could be sent in error), while the lost-prior-draft case is recoverable (the user re-issues the prior command).
+- **Single-slot means no concurrent drafts.** Two pending drafts cannot coexist. If the user wants to keep a Jacqueline draft and prepare a Nater draft separately, only one slot is available. We accept this because the user's workflow is "issue one draft command, review on iPhone, send or discard, issue the next." Concurrent drafts would require option 2 (per-id files) and the queueing semantics that come with it.
+- **`clearICloudDriveDraft()` at `src/relay.ts:1046`** (the `alreadyAnsweredLastMessageDraft` branch) is redundant with the earlier clear at line 942 (line 942 already fires whenever this branch runs, because `wantsIMessagePlacement` is the precondition for `alreadyAnsweredLastMessageDraft`). It is harmless defense-in-depth. Leave it; do not impulsively remove it.
+
+### Hard "do not do" list (under the four principles)
+
+Future contributors must NOT, without first re-reading the Kimi analysis at `tasks/telegram-relay-architecture-investigation-prompt-2026-05-17.md`:
+
+- Embed the draft body in a Telegram message persistence layer.
+- Attempt to auto-open the ClaudeDraft Shortcut from Telegram (the `shortcuts://` deep link in Telegram message text is known unreliable; the user manually opens Shortcuts).
+- Add a relay-side "confirm send" dialog or timer that bypasses Show When Run.
+- Introduce a queue, draft-id directory, or pointer file in iCloud Drive.
+- Add an iCloud Drive consumption protocol (relay deletes after the Shortcut reads).
+- Replace iCloud Drive transport with a custom server, push notification service, or pairing system.
+
+If you find yourself wanting to do any of the above, the architecture is telling you the problem is somewhere else (a stale text decoder, a brittle parser, a missed cleanup) — fix that instead.
