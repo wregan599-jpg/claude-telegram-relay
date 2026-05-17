@@ -1715,3 +1715,18 @@
   messages with Peggy" and "Draft a message saying hey". Anchor the lowercase
   allowance to request-start commands such as `Text`, `Message`, or `Ping`
   with an optional polite prefix.
+
+## 2026-05-17 — Direct text bodies still need thread context and writing rules
+
+- Do not treat `Text <contact> saying <body>` as a verbatim placement request
+  for named contacts. Live issue: after the lowercase parser fix, Jacqueline
+  resolved and the iPhone compose box was verified, but the relay wrote the
+  literal body `where you at?` because `directBody` suppressed context
+  injection and bypassed Claude.
+- For named contacts, treat the direct body as the core meaning. Still inject
+  the last 5 to 10 iMessages when the resolver can read the thread, then let
+  Claude apply the user's human-writing rules. Preserve the intent, but match
+  the relationship, cadence, and warmth from the actual thread.
+- Keep the direct-body bypass only for direct phone/email recipients or runtime
+  failures where no safe thread can be read. That preserves a deterministic
+  fallback while preventing ordinary named-contact drafts from skipping context.

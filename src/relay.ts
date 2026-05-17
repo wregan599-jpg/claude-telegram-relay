@@ -894,13 +894,25 @@ bot.on("message:text", async (ctx) => {
         })
         : null;
     const wantsIMessagePlacement = draftRequest?.wantsPlacement ?? false;
-    // Inject thread context whenever there is a result and no direct body.
-    // Previously this was gated to status === "found", which silently dropped
-    // empty/error status messages and left Claude with no explanation of why
-    // context was missing — causing off-script "what's the last thing she sent
-    // you?" responses. renderIMessageContext handles all statuses gracefully.
+    // Inject thread context for named iMessage drafts, including direct-body
+    // requests like "Text Jacqueline saying ...". The supplied body is the
+    // user's core meaning, not proof we should skip the user's writing rules or
+    // the last 5-10 messages from the actual thread. Direct phone/email targets
+    // still bypass context because there is no safe local thread name to read.
+    //
+    // Previously this was gated away whenever `directBody` existed, which made
+    // the relay place literal text and skip Claude entirely. Live failure
+    // 2026-05-17: "Text jacqueline saying where you at?" wrote exactly that
+    // phrase even though the thread context was available.
+    const hasThreadContextForDrafting =
+      Boolean(imessageContextResult) &&
+      !directResolvedRecipient &&
+      (imessageContextResult!.status === "found" ||
+        imessageContextResult!.status === "empty");
     const shouldInjectContext =
-      Boolean(imessageContextResult) && !draftRequest?.directBody;
+      Boolean(imessageContextResult) &&
+      !directResolvedRecipient &&
+      (!draftRequest?.directBody || hasThreadContextForDrafting);
     const imessageContext = shouldInjectContext
       ? renderIMessageContext(imessageContextResult!)
       : "";
@@ -948,7 +960,10 @@ bot.on("message:text", async (ctx) => {
       .filter(Boolean)
       .join("\n\n");
     const directIMessageBody =
-      wantsIMessagePlacement && draftRequest?.directBody && !draftRequest.wantsContext
+      wantsIMessagePlacement &&
+      draftRequest?.directBody &&
+      !draftRequest.wantsContext &&
+      !hasThreadContextForDrafting
         ? draftRequest.directBody
         : undefined;
     const shouldClarifyMissingIMessageBody =
@@ -1698,7 +1713,7 @@ function buildPrompt(
     // Hard rule logged 2026-05-11 after the user asked for context-aware
     // drafts. Always read 5 to 10 prior messages before drafting a reply.
     // See feedback_context_before_drafting.md for the durable policy.
-    "Context-before-drafting rule (hard): whenever the user asks you to draft an iMessage or email REPLY to someone, work from the injected context. For iMessage, the relay always attempts to fetch the thread before you run — the result appears as an 'IMESSAGE CONTEXT FOR <name>' block above. If the block says messages were found, use them. If the block says the thread was not found or context could not be read, draft from the user's description as best you can — do NOT ask the user for a phone number, prior messages, or any other clarifying information. Do not claim you lack iMessage access; the relay owns that lookup. For email replies, ask the user to paste the most recent thread only if no context was supplied at all.",
+    "Context-before-drafting rule (hard): whenever the user asks you to draft an iMessage, text, SMS, or email to someone, work from the injected context. For iMessage/text/SMS, the relay always attempts to fetch the last 5 to 10 messages from the relevant thread before you run. The result appears as an 'IMESSAGE CONTEXT FOR <name>' block above. If the block says messages were found, use them to match the relationship, cadence, and level of warmth while preserving the user's exact intended meaning. If the block says the thread was not found or context could not be read, draft from the user's description as best you can. Do NOT ask the user for a phone number, prior messages, or any other clarifying information. Do not claim you lack iMessage access; the relay owns that lookup. For email replies, ask the user to paste the most recent thread only if no context was supplied at all.",
     "Context cleanup rule (hard): never save the fetched context to a local file. The read helper streams JSON to stdout; consume it in your working memory only. Do NOT write context to ~/Projects/claude-telegram-relay/data/ or anywhere else on disk. If you find an existing cached context file from a prior session (e.g. data/mom-imessages.json), delete it after use rather than reusing it. The user's machine is the source of truth; re-read fresh from chat.db each time rather than caching.",
     "iMessage handling is deterministic in this runtime. The relay reads thread context before you run and places drafts after you run (using the marker pattern described below when relevant). Do NOT attempt to call scripts/imessage-thread.sh or scripts/draft-imessage.sh yourself; in headless mode you have no Bash approval surface and the call will surface as a confusing 'blocked for approval' message to the user. Just respond in text and use the markers when asked to place a draft.",
     "For email drafts in this runtime, produce the draft text only. Do NOT call scripts/draft-email.sh or any mail client helper; ordinary Telegram turns do not expose Bash tools.",
@@ -1730,7 +1745,7 @@ function buildPrompt(
       DRAFT_MARKER_OPEN,
       "(the iMessage body)",
       DRAFT_MARKER_CLOSE,
-      `You may add one short lead sentence BEFORE the opening marker (e.g. "Here's the draft for ${contact}:"). Write NOTHING after the closing marker. The relay appends its own handoff status line based on what actually happened (iPhone Shortcut handoff, Mac compose fallback, clipboard fallback, or failure), and any line you add will either be discarded or contradict the truth. In particular: do NOT write "Draft is in the Messages compose box", "Draft is placed", "Ready to send", "I've opened Messages", or any variation — the relay owns that status. Do NOT call any tool, do NOT mention scripts, and NEVER say the placement was blocked for approval — there is no approval surface in this runtime.`,
+      `Treat any phrase after "saying", "say", or "with" in the user's message as the core meaning to preserve, not necessarily as verbatim wording. Use the injected iMessage context when present, then rewrite the body so it sounds organic, confident, warm, and human. Keep it concise enough for a real text message unless the user asks for length. Do not use hyphen, en dash, or em dash characters in the draft body. You may add one short lead sentence BEFORE the opening marker (e.g. "Here's the draft for ${contact}:"). Write NOTHING after the closing marker. The relay appends its own handoff status line based on what actually happened (iPhone Shortcut handoff, Mac compose fallback, clipboard fallback, or failure), and any line you add will either be discarded or contradict the truth. In particular: do NOT write "Draft is in the Messages compose box", "Draft is placed", "Ready to send", "I've opened Messages", or any variation — the relay owns that status. Do NOT call any tool, do NOT mention scripts, and NEVER say the placement was blocked for approval — there is no approval surface in this runtime.`,
     );
   }
 

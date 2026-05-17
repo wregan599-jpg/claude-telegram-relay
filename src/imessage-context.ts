@@ -237,9 +237,10 @@ export interface IMessageDraftRequest {
   contextLimit: number;
   wantsPlacement: boolean;
   /**
-   * Exact body supplied by the user in this turn. When present and no prior
-   * thread context was requested, the relay can place the draft without a
-   * Claude round trip or marker compliance risk.
+   * Body instruction supplied by the user in this turn. For named contacts,
+   * the relay treats this as the core meaning and still lets Claude apply
+   * thread context plus writing-style rules. For direct phone/email targets
+   * where no local thread can be read, the relay may place this body directly.
    */
   directBody?: string;
 }
