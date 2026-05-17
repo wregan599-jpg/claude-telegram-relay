@@ -1383,6 +1383,12 @@
   file must not change the user-facing response for every Telegram draft.
   `setup:verify` already fails on that artifact, which is the correct place to
   surface the pending-install problem.
+- 2026-05-17 correction: if the phone has just lost/deleted all shortcuts and
+  the fixed `ClaudeDraft.shortcut` install artifact is present, a plain "Run
+  ClaudeDraft" status is misleading because the iPhone target may not exist.
+  Surface `phone_shortcut_install_pending` with the exact Files -> iCloud Drive
+  -> `ClaudeDraft.shortcut` install/replace instruction until the artifact is
+  removed after a real iPhone compose-body verification.
 - Do not expose `shortcuts://run-shortcut?...` in Telegram copy. Telegram
   rejects custom schemes in inline keyboards and does not make custom-scheme
   message text a reliable trigger. Keep the runtime wording simple:
@@ -1652,3 +1658,106 @@
   indications, not a role paraphrase. Helper lives in `src/prompt-split.ts`
   so it can be unit-tested without triggering relay's top-level lock
   acquisition.
+
+## 2026-05-17 — Anesthesia corpus portability and gate-boundary regression test
+
+- `ANESTHESIA_CORPUS_ROOT` was a literal `/Users/williamregan/Desktop/...`
+  string baked into `src/anesthesia-corpus.ts`. It compiled, ran, and passed
+  tests on the only Mac that mattered today, but the runtime instruction
+  block told Claude only one root existed while `retrieval.ts` actually
+  searched two roots (`~/Desktop/...` and `~/Downloads/...`). Citations
+  from the Downloads root were valid retrievals but Claude had been told
+  that root did not exist.
+- Fix: derive `ANESTHESIA_CORPUS_ROOTS` from `homedir()`, expose it as a
+  readonly array, and rebuild `ANESTHESIA_CORPUS_INSTRUCTIONS` to mention
+  both roots. Keep `ANESTHESIA_CORPUS_ROOT` as a back-compat alias for the
+  primary root so existing imports keep building.
+- Added a `prepareFtsQuery` test that pins the corpus gate boundary: a set
+  of benign non-medical queries ("set a reminder for 10pm", "what is on my
+  calendar tomorrow") must return `corpusScoped: false` and must NOT
+  include the textbook roots in `scopePatterns`. This is the regression
+  guard for `isAnesthesiaCorpusQuery` accidentally widening to match
+  everything, which would silently scope every retrieval to the textbook
+  corpus and starve general-conversation answers.
+- Documented the classifier's known false positives ("airway" in allergy
+  context, "RSI" as repetitive strain injury, "epidural" steroid
+  injection for back pain) as accepted tradeoffs in tests, so future
+  contributors do not narrow the patterns without weighing the user-side
+  tradeoff (terse anesthesia queries like "RSI dosing for rocuronium"
+  must keep routing to FTS without explicit textbook framing).
+
+## 2026-05-17 — iPhone Shortcut verification needs exact UI state checks
+
+- Mirroir OCR coordinates are labels, not always the tappable control. A loose
+  regex for `OK` matched the `Quick Look` shortcut label and tapped the wrong
+  tile. For permission prompts, match exact quoted button labels from OCR lines
+  or use fixed coordinates from a screenshot after visual confirmation.
+- When `ClaudeDraft` opens Messages, the Shortcuts tile can remain in a running
+  state with a small stop control. Subsequent taps on the shortcut body may do
+  nothing until that stale run is stopped. If a rerun is needed, return to
+  Shortcuts, tap the stop control in the top-right of the `ClaudeDraft` tile,
+  then tap the tile body again.
+- Keep the iCloud install marker (`~/Library/Mobile Documents/com~apple~CloudDocs/ClaudeDraft.shortcut`)
+  until a real iPhone compose-body verification has been observed. After the
+  phone opens Messages with the expected recipient and body, move or remove the
+  marker and rerun `bun run setup:verify`; otherwise the relay should keep
+  surfacing `phone_shortcut_install_pending`.
+
+## 2026-05-17 — Command-position iMessage names can be lowercase
+
+- Live Telegram command `Text jacqueline saying where you at?` was received
+  by the relay but fell through to the generic Claude path because
+  `COMMAND_POSITION_CONTACT_RE` only accepted capitalized proper names,
+  phone numbers, and emails. Direct draft commands typed on a phone are often
+  lowercase and should not depend on Claude marker compliance.
+- The fix must stay command-position only. Allowing lowercase names in the
+  generic `to/with` branch reintroduces old false positives like "text
+  messages with Peggy" and "Draft a message saying hey". Anchor the lowercase
+  allowance to request-start commands such as `Text`, `Message`, or `Ping`
+  with an optional polite prefix.
+
+## 2026-05-17 — Direct text bodies still need thread context and writing rules
+
+- Do not treat `Text <contact> saying <body>` as a verbatim placement request
+  for named contacts. Live issue: after the lowercase parser fix, Jacqueline
+  resolved and the iPhone compose box was verified, but the relay wrote the
+  literal body `where you at?` because `directBody` suppressed context
+  injection and bypassed Claude.
+- For named contacts, treat the direct body as the core meaning. Still inject
+  the last 5 to 10 iMessages when the resolver can read the thread, then let
+  Claude apply the user's human-writing rules. Preserve the intent, but match
+  the relationship, cadence, and warmth from the actual thread.
+- Keep the direct-body bypass only for direct phone/email recipients or runtime
+  failures where no safe thread can be read. That preserves a deterministic
+  fallback while preventing ordinary named-contact drafts from skipping context.
+
+## 2026-05-17 — Modern Messages rows store text in `attributedBody`
+
+- Live issue: `Respond to Conor's last message` drafted `ha might need a full
+  neuro exam at this point` because the context helper filtered on
+  `message.text IS NOT NULL`. Current Conor rows in `chat.db` had NULL
+  `message.text` with the visible body inside `message.attributedBody`, so the
+  relay skipped April 2026 context and fell back to an October 2025 message:
+  `May have to check his reflexes`.
+- Any iMessage context reader must decode `attributedBody` before deciding the
+  thread is stale or empty. Also skip tapback rows (`associated_message_type`
+  nonzero) so "Loved ..." reactions do not masquerade as real message bodies.
+- For vague commands like `reply/respond to <person>'s last message`, decline
+  automatic placement when the latest decoded thread message is already from
+  the user. That is safer than inventing a new follow-up to an already answered
+  thread.
+
+## 2026-05-17 — Clear stale iPhone handoffs before every new draft attempt
+
+- Live issue: after Jacqueline's draft was written to `latest.json`, a later
+  Nater command fell through the non-draft path and then failed the first
+  fixed draft run because a decoded Messages row contained a null byte. During
+  both failures, `latest.json` still pointed at Jacqueline, so ClaudeDraft
+  reopened the wrong compose even though Telegram showed a new Nater draft.
+- Fix pattern: as soon as the relay recognizes a new iMessage placement
+  request, delete the old CloudDocs `latest.json` before Claude runs. If the
+  new request fails, ClaudeDraft should find no stale handoff rather than a
+  previous recipient/body.
+- Also sanitize decoded iMessage text for null/control bytes before injecting
+  it into the Claude CLI prompt. Bun refuses spawn args containing null bytes,
+  so raw `attributedBody` extraction must never feed `\0` into `callClaude`.
