@@ -1498,6 +1498,34 @@
   to the Telegram handler so decision logs carry `error=claude_exit_*` instead
   of persisting "Claude CLI failed..." as if it were a normal model response.
 
+## 2026-05-17 - Worktree drift; process reset over codebase reset
+
+- When a feature worktree was created from a stale commit on main and main's
+  working tree has advanced with verified runtime fixes, do NOT try to reconcile
+  by pulling stale-vs-worktree files INTO the worktree. That accumulates
+  "wip-snapshot" commits and produces a mongrel branch that is neither a clean
+  rebase nor a clean PR. The recovery is: commit main's WIP as a safety
+  snapshot, then treat the worktree branch as a patch SOURCE — cherry-pick
+  only NEW modules forward to main, one small PR each. Files that main has
+  independently advanced (`src/relay.ts`, `src/retrieval.ts`,
+  `src/decision-log.ts`, `scripts/draft-imessage.sh`, `scripts/resolve-contact.py`,
+  `scripts/smoke-textbook-retrieval.ts`) are NOT eligible for backport from
+  the stale worktree.
+- New modules ported forward must match main's existing inline semantics
+  precisely. `src/session.ts` ported from the audit branch had to be adjusted
+  to (a) keep the optional `createdAt` field that main's inline `SessionState`
+  carries, (b) call `ensurePrivateDir` before writing the session file (main's
+  inline `saveSession` does), (c) match main's `HOME || "~"` default relay dir,
+  and (d) have `rotateSession` return a fresh `SessionState` after deleting the
+  file so future relay wiring cannot accidentally keep using a stale in-memory
+  `--resume` id. Porting verbatim would have dropped `createdAt`, skipped the
+  directory creation, and made stale session reuse too easy during integration.
+- Add-ons (Gmail, WhatsApp, Supabase dual-memory, voice reply) stay out of the
+  relay's hot path until each has its own draft-only acceptance test. The
+  draft-router em-dash gate and iMessage recipient allowlist are the
+  draft-only safety architecture; nothing that produces an outbound action
+  bypasses them.
+
 ## 2026-05-17 — Compass relay audit integration
 
 - Implement high-risk relay fixes before broad add-ons. Supabase dual-memory,
