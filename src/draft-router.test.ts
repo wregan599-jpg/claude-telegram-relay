@@ -31,9 +31,11 @@ test("gateForEmDash allows clean text", () => {
 });
 
 let workdir: string;
+let oldHome: string | undefined;
 
 beforeEach(async () => {
   workdir = await mkdtemp(join(tmpdir(), "relay-dr-"));
+  oldHome = process.env.HOME;
   process.env.RELAY_DIR = workdir;
   process.env.IMESSAGE_ALLOWLIST_PATH = join(workdir, "imessage-allowlist.json");
   resetAllowlistCache();
@@ -43,6 +45,11 @@ afterEach(async () => {
   await rm(workdir, { recursive: true, force: true });
   delete process.env.RELAY_DIR;
   delete process.env.IMESSAGE_ALLOWLIST_PATH;
+  if (oldHome === undefined) {
+    delete process.env.HOME;
+  } else {
+    process.env.HOME = oldHome;
+  }
   resetAllowlistCache();
 });
 
@@ -88,6 +95,34 @@ test("gateForIMessageRecipient: array with non-string entries => skips non-strin
   );
   expect(await gateForIMessageRecipient("+15551234567")).toEqual({ ok: true });
   expect(await gateForIMessageRecipient("alex@example.com")).toEqual({ ok: true });
+});
+
+test("gateForIMessageRecipient: default path matches relay HOME fallback", async () => {
+  delete process.env.IMESSAGE_ALLOWLIST_PATH;
+  delete process.env.RELAY_DIR;
+  process.env.HOME = workdir;
+  await mkdir(join(workdir, ".claude-relay"), { recursive: true });
+  await writeFile(
+    join(workdir, ".claude-relay", "imessage-allowlist.json"),
+    JSON.stringify(["+15551234567"]),
+  );
+  resetAllowlistCache();
+
+  expect(await gateForIMessageRecipient("+15551234567")).toEqual({ ok: true });
+});
+
+test("gateForIMessageRecipient: empty RELAY_DIR does not create a relative allowlist path", async () => {
+  delete process.env.IMESSAGE_ALLOWLIST_PATH;
+  process.env.RELAY_DIR = "";
+  process.env.HOME = workdir;
+  await mkdir(join(workdir, ".claude-relay"), { recursive: true });
+  await writeFile(
+    join(workdir, ".claude-relay", "imessage-allowlist.json"),
+    JSON.stringify(["+15551234567"]),
+  );
+  resetAllowlistCache();
+
+  expect(await gateForIMessageRecipient("+15551234567")).toEqual({ ok: true });
 });
 
 test("scheduleStillThinking cancel function prevents the send", async () => {

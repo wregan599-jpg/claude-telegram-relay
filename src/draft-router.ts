@@ -12,7 +12,6 @@
 
 import { readFile, stat } from "fs/promises";
 import { join } from "path";
-import { homedir } from "os";
 
 const TELEGRAM_SOFT_LIMIT = 4000; // margin under 4096 for HTML entities
 const STILL_THINKING_MS = 60_000;
@@ -35,7 +34,7 @@ export function gateForEmDash(text: string): Gate | GateFailure {
 
 function allowlistPath(): string {
   return process.env.IMESSAGE_ALLOWLIST_PATH
-    ?? join(process.env.RELAY_DIR ?? join(homedir(), ".claude-relay"), "imessage-allowlist.json");
+    || join(process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay"), "imessage-allowlist.json");
 }
 
 // In-memory cache keyed by path+mtime so we re-read on file changes without
@@ -73,7 +72,7 @@ export async function gateForIMessageRecipient(
   const allow = await loadAllowlist();
   if (!allow) {
     console.error(
-      `[draft-router] iMessage allowlist missing or invalid at ${allowlistPath()}; refusing recipient ${recipient}`,
+      `[draft-router] iMessage allowlist missing or invalid at ${allowlistPath()}; refusing recipient`,
     );
     return { ok: false, reason: "recipient_not_allowlisted" };
   }

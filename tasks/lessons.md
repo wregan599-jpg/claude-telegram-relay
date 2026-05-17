@@ -1579,3 +1579,7 @@
   paragraph-aware splitting; the draft-router's split is available for
   callers that need sentence-level fallback when a Claude reply exceeds
   4096 chars in one paragraph.
+- Draft-router must share the relay's `RELAY_DIR || HOME || "~"` fallback
+  semantics. A dormant safety module with a slightly different state path will
+  pass unit tests and then fail when wired into launchd. Also avoid logging raw
+  iMessage recipients when an allowlist is missing; the failure reason is enough.
