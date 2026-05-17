@@ -8,6 +8,7 @@ import {
   __test__relaxedBookQueries,
   __test__relaxedCorpusQueries,
   __test__rerankFtsHits,
+  search,
   type Hit,
 } from "./retrieval";
 
@@ -74,6 +75,28 @@ test("book tokens become path filters instead of required FTS terms", () => {
   expect(prepared.scopePatterns).toContain(
     `${process.env.HOME}/Downloads/anes-textbooks-markdown/miller10/%`,
   );
+});
+
+test("book alias typos become canonical path filters", () => {
+  const prepared = __test__prepareFtsQuery("brash intubating dose rocuronium");
+
+  expect(prepared.match).toBe("intubating dose rocuronium");
+  expect(prepared.bookScoped).toBe(true);
+  expect(prepared.scopePatterns).toContain(
+    `${process.env.HOME}/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/barash9/%`,
+  );
+  expect(prepared.scopePatterns).toContain(
+    `${process.env.HOME}/Downloads/anes-textbooks-markdown/barash9/%`,
+  );
+});
+
+test("book alias typo search returns canonical book hits", async () => {
+  const hits = await search('"barash" "intubating" "dose" "rocuronium"', 5);
+
+  expect(hits.length).toBeGreaterThan(0);
+  expect(hits[0].file_path).toContain("/barash9/");
+  expect(hits[0].content.toLowerCase()).toContain("intubating dose");
+  expect(hits[0].content.toLowerCase()).toContain("rocuronium");
 });
 
 test("book-filtered FTS refuses broad single-token content queries", () => {

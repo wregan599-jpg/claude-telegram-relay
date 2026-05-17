@@ -49,6 +49,12 @@ test("keeps strong textbook anchors from current message", () => {
   );
 });
 
+test("canonicalizes common textbook typos before building the query", () => {
+  expect(
+    buildSearchQuery("What does brash say the intubating dose is for rocuronium", []),
+  ).toBe('"barash" "intubating" "dose" "rocuronium"');
+});
+
 test("drops conversational say/says/said words from textbook questions", () => {
   expect(
     buildSearchQuery("What does Miller say are the indications for an arterial line?", []),

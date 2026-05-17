@@ -18,7 +18,7 @@ const DRAFT_BLOCK_RE = /<<<IMESSAGE_DRAFT>>>([\s\S]*?)<<<END_IMESSAGE_DRAFT>>>/;
 const ORPHAN_MARKER_RE = /<<<\/?(?:END_)?IMESSAGE_DRAFT>>>/g;
 const HELPER_TIMEOUT_MS = 25_000;
 const PHONE_HANDOFF_LINE_RE =
-  /\n*[ \t]*(?:Phone handoff ready|Open on iPhone):\s*(shortcuts:\/\/run-shortcut\?name=[^\s]+)\s*\n*/i;
+  /\n*[ \t]*(?:Phone handoff ready|Open on iPhone)(?:\s+for\s+([^:\n]+))?:\s*(shortcuts:\/\/run-shortcut\?name=[^\s]+)\s*\n*/i;
 
 // Claude likes to append boilerplate after a draft: "Draft is in the Messages
 // compose box for X. Review and send when ready." or "Draft above, review
@@ -182,10 +182,14 @@ export function formatPhoneHandoffForTelegram(response: string): string {
   if (!match) return response;
 
   const stripped = response.replace(PHONE_HANDOFF_LINE_RE, "\n\n").trim();
+  const target = match[1]?.trim();
+  const instruction = target
+    ? `Drafting to ${target}. Run ClaudeDraft in Shortcuts on your iPhone.`
+    : "Run ClaudeDraft in Shortcuts on your iPhone.";
 
   return stripped.length > 0
-    ? `${stripped}\n\nRun ClaudeDraft in Shortcuts on your iPhone.`
-    : "Run ClaudeDraft in Shortcuts on your iPhone.";
+    ? `${stripped}\n\n${instruction}`
+    : instruction;
 }
 
 /**

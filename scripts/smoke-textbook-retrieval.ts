@@ -32,6 +32,15 @@ const checks = [
     ],
   },
   {
+    message: "What does brash say the intubating dose is for rocuronium",
+    expectedQuery: '"barash" "intubating" "dose" "rocuronium"',
+    maxWallMs: 5000,
+    expectedPathFragments: [
+      "/Desktop/Exam_Prep/Textbooks/anes-textbooks-markdown/barash9/",
+      "/Downloads/anes-textbooks-markdown/barash9/",
+    ],
+  },
+  {
     message: "Rocuronium dosing and onset for RSI adult vs pediatric",
     expectedQuery: '"rocuronium" "pediatric" "dosing" "adult" "onset"',
     maxWallMs: 8000,

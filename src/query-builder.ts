@@ -3,7 +3,7 @@
 // Returns "" when fewer than two useful content tokens remain, so callers can
 // skip broad single-token searches that are both noisy and expensive.
 
-import { BOOK_KEY_SET } from "./books";
+import { BOOK_KEY_SET, canonicalBookToken } from "./books";
 
 export interface Turn {
   role: "user" | "assistant";
@@ -116,6 +116,7 @@ function filterContent(raw: string, extraStopwords?: Set<string>): string[] {
     .toLowerCase()
     .split(/\s+/)
     .map((token) => token.replace(/[^a-z0-9]/g, ""))
+    .map(canonicalBookToken)
     .filter((token) => token.length >= MIN_TOKEN_LEN)
     .filter((token) => !isPureDigits(token))
     .filter((token) => !STOPWORDS.has(token))

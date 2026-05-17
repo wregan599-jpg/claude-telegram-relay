@@ -1151,7 +1151,7 @@ bot.on("message:text", async (ctx) => {
             imessageDraftMode = "icloud_drive_file";
             assistantText = rebuildAroundDraftBlock(
               assistantText,
-              `${body}\n\nPhone handoff ready: ${handoff.shortcutUrl}`,
+              `${body}\n\nPhone handoff ready for ${contactLabel} (${resolved}): ${handoff.shortcutUrl}`,
             );
           } else {
             placement = await placeIMessageDraft(PROJECT_ROOT, target, body);

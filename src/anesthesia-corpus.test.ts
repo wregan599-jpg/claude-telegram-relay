@@ -19,6 +19,7 @@ test("anesthesia corpus prompt is adapted for relay-owned retrieval", () => {
   ]);
   expect(ANESTHESIA_CORPUS_INSTRUCTIONS).toContain("RELEVANT INDEXED CONTENT");
   expect(ANESTHESIA_CORPUS_INSTRUCTIONS).toContain("Not found in corpus");
+  expect(ANESTHESIA_CORPUS_INSTRUCTIONS).toContain("Do not add a fallback answer from general medical knowledge");
   expect(ANESTHESIA_CORPUS_INSTRUCTIONS).toContain("Do not claim you ran live tools");
   expect(ANESTHESIA_CORPUS_INSTRUCTIONS).not.toContain("<role>");
   expect(ANESTHESIA_CORPUS_INSTRUCTIONS).not.toMatch(/\b(?:rg|ripgrep|bash|grep)\b/i);

@@ -8,7 +8,7 @@ import { accessSync, constants } from "fs";
 import { homedir } from "os";
 import { basename, dirname, join } from "path";
 import { isAnesthesiaCorpusQuery } from "./anesthesia-corpus";
-import { BOOKS, BOOK_KEY_SET, CATALOG_BOOK_LIST } from "./books";
+import { BOOKS, BOOK_KEY_SET, CATALOG_BOOK_LIST, canonicalBookToken } from "./books";
 
 const DB_PATH = process.env.INDEXER_DB
   ?? join(homedir(), ".local-search", "metadata.db");
@@ -264,6 +264,7 @@ function queryTokens(query: string): string[] {
     .toLowerCase()
     .split(/\s+/)
     .map((token) => token.replace(/[^a-z0-9]/g, ""))
+    .map(canonicalBookToken)
     .filter(Boolean);
 }
 

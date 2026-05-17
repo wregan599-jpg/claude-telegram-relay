@@ -255,6 +255,18 @@ test("phone handoff formatting keeps Shortcuts handoff Telegram-safe", () => {
   expect(formatted).not.toContain("shortcuts://run-shortcut?name=ClaudeDraft");
 });
 
+test("phone handoff formatting surfaces the resolved recipient", () => {
+  const formatted = formatPhoneHandoffForTelegram(
+    "heading to London\n\nPhone handoff ready for dad (+16048092405): shortcuts://run-shortcut?name=ClaudeDraft\n",
+  );
+
+  expect(formatted).toBe(
+    "heading to London\n\nDrafting to dad (+16048092405). Run ClaudeDraft in Shortcuts on your iPhone.",
+  );
+  expect(formatted).not.toContain("Phone handoff ready:");
+  expect(formatted).not.toContain("shortcuts://run-shortcut?name=ClaudeDraft");
+});
+
 test("phone handoff formatting strips legacy Open on iPhone handoff line", () => {
   const formatted = formatPhoneHandoffForTelegram(
     "Here's the draft for Mark:\n\nHey Mark, sounds good.\n\nOpen on iPhone: shortcuts://run-shortcut?name=ClaudeDraft\n",

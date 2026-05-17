@@ -1627,6 +1627,11 @@
   need a bounded relaxation pass. The first query-builder token is the strongest
   clinical anchor after ranking; pair it with later tokens before falling back
   to adjacent pairs.
+- Book-name typo normalization must happen before both query building and
+  retrieval path-filtering. Live failure 2026-05-17: "brash" was semantically
+  meant as Barash, but the FTS query treated it as ordinary content and mixed in
+  Miller chunks. Common typo aliases belong in `books.ts` and should canonicalize
+  to the book key before token ranking and `BOOK_PATH_FILTERS` routing.
 
 ## 2026-05-17 — System/user prompt separation via Claude CLI
 

@@ -13,7 +13,7 @@ export const BOOKS: readonly BookDefinition[] = [
     key: "barash",
     label: "Barash 9",
     pathSegment: "barash9",
-    aliases: ["barash"],
+    aliases: ["barash", "brash"],
   },
   {
     key: "chestnut",
@@ -50,6 +50,13 @@ export const BOOKS: readonly BookDefinition[] = [
 export const BOOK_KEYS = BOOKS.map((book) => book.key);
 export const BOOK_KEY_SET: ReadonlySet<string> = new Set(BOOK_KEYS);
 export const CATALOG_BOOK_LIST = BOOKS.map((book) => book.label);
+export const BOOK_ALIAS_TO_KEY: ReadonlyMap<string, string> = new Map(
+  BOOKS.flatMap((book) => book.aliases.map((alias) => [alias, book.key])),
+);
+
+export function canonicalBookToken(token: string): string {
+  return BOOK_ALIAS_TO_KEY.get(token) ?? token;
+}
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
