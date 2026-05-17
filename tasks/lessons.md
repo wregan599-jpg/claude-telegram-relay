@@ -1583,3 +1583,23 @@
   semantics. A dormant safety module with a slightly different state path will
   pass unit tests and then fail when wired into launchd. Also avoid logging raw
   iMessage recipients when an allowlist is missing; the failure reason is enough.
+
+## 2026-05-17 — System/user prompt separation via Claude CLI
+
+- Concatenating the system instructions and the user message into a single
+  `-p <prompt>` argument can make Claude paraphrase its own role back as the
+  reply when retrieval scores poorly. Live failure 2026-05-17T07:17:04Z on
+  "Search for what cote says are the indications for arterial line placement"
+  returned ~190 chars of role recitation ("You are responding to William
+  directly. Use the search results above as factual grounding ...") instead
+  of the actual clinical content. `response-sanitize.ts` cannot help because
+  the leak is original prose, not a tagged block.
+- The fix is structural: pass durable rules + per-turn context to
+  `--append-system-prompt` and pass only the user message to `-p`. Split the
+  built prompt at the LAST `\nUser: ` marker so inner `User:` / `Assistant:`
+  labels inside a RECENT CONVERSATION block stay in the system half.
+- Verified by re-issuing the failing prompt through the CLI in the new shape:
+  Claude returned a real pediatric-anesthesia answer with bullet-listed
+  indications, not a role paraphrase. Helper lives in `src/prompt-split.ts`
+  so it can be unit-tested without triggering relay's top-level lock
+  acquisition.
