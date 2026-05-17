@@ -40,31 +40,44 @@ function teardown() {
 }
 
 test("alias override returns the configured identifier", async () => {
-  const aliasPath = setupAliases(JSON.stringify({ dad: "+16043154583" }));
+  const aliasPath = setupAliases(JSON.stringify({ dad: "+16048092405" }));
   try {
     const r = await runResolver("dad", aliasPath);
     expect(r.exit).toBe(0);
-    expect(r.out).toBe("+16043154583");
+    expect(r.out).toBe("+16048092405");
   } finally {
     teardown();
   }
 });
 
 test("alias lookup is case-insensitive", async () => {
-  const aliasPath = setupAliases(JSON.stringify({ dad: "+16043154583" }));
+  const aliasPath = setupAliases(JSON.stringify({ dad: "+16048092405" }));
   try {
-    expect((await runResolver("Dad", aliasPath)).out).toBe("+16043154583");
-    expect((await runResolver("DAD", aliasPath)).out).toBe("+16043154583");
+    expect((await runResolver("Dad", aliasPath)).out).toBe("+16048092405");
+    expect((await runResolver("DAD", aliasPath)).out).toBe("+16048092405");
   } finally {
     teardown();
   }
 });
 
 test("alias values are normalized to E.164 if they look like a phone", async () => {
-  const aliasPath = setupAliases(JSON.stringify({ dad: "1 (604) 315-4583" }));
+  const aliasPath = setupAliases(JSON.stringify({ dad: "6048092405" }));
   try {
     const r = await runResolver("dad", aliasPath);
-    expect(r.out).toBe("+16043154583");
+    expect(r.out).toBe("+16048092405");
+  } finally {
+    teardown();
+  }
+});
+
+test("parent aliases stay distinct when both are configured", async () => {
+  const aliasPath = setupAliases(JSON.stringify({
+    dad: "6048092405",
+    mom: "6043154583",
+  }));
+  try {
+    expect((await runResolver("Dad", aliasPath)).out).toBe("+16048092405");
+    expect((await runResolver("Mom", aliasPath)).out).toBe("+16043154583");
   } finally {
     teardown();
   }
@@ -124,12 +137,12 @@ test("non-object alias JSON is silently ignored", async () => {
 
 test("non-string alias values are skipped (mixed-type file)", async () => {
   const aliasPath = setupAliases(JSON.stringify({
-    dad: "+16043154583",
+    dad: "+16048092405",
     badvalue: 42,
     nested: { phone: "+1xxxxxxxxxx" },
   }));
   try {
-    expect((await runResolver("dad", aliasPath)).out).toBe("+16043154583");
+    expect((await runResolver("dad", aliasPath)).out).toBe("+16048092405");
     // 'badvalue' and 'nested' silently dropped; resolver falls through.
     expect((await runResolver("badvalue", aliasPath)).out).not.toBe("42");
   } finally {

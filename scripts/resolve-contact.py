@@ -225,14 +225,14 @@ def load_aliases() -> dict[str, str]:
 
     The file is consulted BEFORE AddressBook lookup. It exists so the user
     can correct mismatches between contact-card data and the chat.db handle
-    they actually message on (e.g. "Dad" -> +16043154583 when their
+    they actually message on (e.g. "Dad" -> +16048092405 when their
     AddressBook "Dad" card holds a different phone that has no message
     history). The file is optional; a missing or malformed file is silently
     ignored and the AddressBook lookup proceeds.
 
     Format (JSON object, keys lowercased before lookup):
       {
-        "dad": "+16043154583",
+        "dad": "+16048092405",
         "mom": "+16043154583",
         "natalie": "natalie@example.com"
       }

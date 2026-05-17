@@ -1590,13 +1590,12 @@
   user's AddressBook and Messages.app diverge. Live failure 2026-05-17:
   every `Text dad saying heading to London` resolved to `+16048741365`
   (AddressBook contact "Dad", primary phone) which has zero messages in
-  `chat.db`; the phone William actually messages his father on is
-  `+16043154583`, stored in AddressBook under contact "Mom" (shared
-  household phone, 726 messages with the nickname "Billy"). The chat
-  context fetch then returned empty on every attempt, the relay
-  short-circuited to "use the literal command body" because `directBody`
-  was set and `wantsContext` was false, never called Claude (`claude_ms=0`),
-  and the iCloud handoff wrote a draft to the wrong number.
+  `chat.db`. A first attempt incorrectly inferred that Dad should map to
+  Mom's active thread (`+16043154583`) based on chat.db volume alone. The user
+  corrected the authoritative mapping: Dad is `+16048092405`; Mom is
+  `+16043154583`. Do not infer family aliases from message counts when the
+  user supplies the actual phone numbers. The relay should make the resolved
+  handle visible before handoff so this class of mistake is obvious.
 - Fix: `~/.claude-relay/contact-aliases.json` is consulted BEFORE the
   AddressBook lookup in `scripts/resolve-contact.py`. Format is a flat
   JSON object mapping lowercased alias to phone-or-email. Direct
@@ -1611,3 +1610,20 @@
   the resolved phone, so the user catches a wrong number BEFORE running
   ClaudeDraft. Today the reply is just "Run ClaudeDraft in Shortcuts on
   your iPhone." with no indication of which handle the draft will go to.
+
+## 2026-05-17 — Anesthesia prompt integration must match relay-owned retrieval
+
+- Do not paste XML prompt blocks that tell Claude to run `rg`, Bash, or search
+  tools into the Telegram relay. Ordinary text turns call Claude with no tools;
+  the relay performs deterministic FTS retrieval before Claude runs and injects
+  `RELEVANT INDEXED CONTENT` into the prompt. Advertising unavailable tools
+  causes false claims and instruction leakage.
+- Generic anesthesia-domain questions need their own retrieval gate. Book-name
+  triggers catch prompts like "What does Miller say...", but "rocuronium dosing
+  and onset for RSI" should also search the converted textbook corpus. Keep the
+  route high precision and scope those queries to the known Markdown textbook
+  roots instead of the whole Obsidian/native-memory search space.
+- If a strict AND FTS query has no hits, corpus-scoped generic medical queries
+  need a bounded relaxation pass. The first query-builder token is the strongest
+  clinical anchor after ranking; pair it with later tokens before falling back
+  to adjacent pairs.
