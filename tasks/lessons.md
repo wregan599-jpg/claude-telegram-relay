@@ -1652,3 +1652,30 @@
   indications, not a role paraphrase. Helper lives in `src/prompt-split.ts`
   so it can be unit-tested without triggering relay's top-level lock
   acquisition.
+
+## 2026-05-17 — Anesthesia corpus portability and gate-boundary regression test
+
+- `ANESTHESIA_CORPUS_ROOT` was a literal `/Users/williamregan/Desktop/...`
+  string baked into `src/anesthesia-corpus.ts`. It compiled, ran, and passed
+  tests on the only Mac that mattered today, but the runtime instruction
+  block told Claude only one root existed while `retrieval.ts` actually
+  searched two roots (`~/Desktop/...` and `~/Downloads/...`). Citations
+  from the Downloads root were valid retrievals but Claude had been told
+  that root did not exist.
+- Fix: derive `ANESTHESIA_CORPUS_ROOTS` from `homedir()`, expose it as a
+  readonly array, and rebuild `ANESTHESIA_CORPUS_INSTRUCTIONS` to mention
+  both roots. Keep `ANESTHESIA_CORPUS_ROOT` as a back-compat alias for the
+  primary root so existing imports keep building.
+- Added a `prepareFtsQuery` test that pins the corpus gate boundary: a set
+  of benign non-medical queries ("set a reminder for 10pm", "what is on my
+  calendar tomorrow") must return `corpusScoped: false` and must NOT
+  include the textbook roots in `scopePatterns`. This is the regression
+  guard for `isAnesthesiaCorpusQuery` accidentally widening to match
+  everything, which would silently scope every retrieval to the textbook
+  corpus and starve general-conversation answers.
+- Documented the classifier's known false positives ("airway" in allergy
+  context, "RSI" as repetitive strain injury, "epidural" steroid
+  injection for back pain) as accepted tradeoffs in tests, so future
+  contributors do not narrow the patterns without weighing the user-side
+  tradeoff (terse anesthesia queries like "RSI dosing for rocuronium"
+  must keep routing to FTS without explicit textbook framing).
