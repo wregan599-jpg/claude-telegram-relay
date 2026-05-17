@@ -9,11 +9,11 @@
 //   - Field-level type narrowing on load: a malformed file never returns a
 //     partial SessionState; it falls back to a fresh default.
 //   - saveSession ensures the parent directory exists at 0700 before writing.
-//   - rotateSession is a pure file-system side effect; the caller is
-//     responsible for reloading in-memory state via loadSession().
+//   - rotateSession deletes the persisted id and returns a fresh in-memory
+//     state so future relay integration can assign it without reusing a stale
+//     `--resume` id.
 
 import { chmod, mkdir, readFile, unlink, writeFile } from "fs/promises";
-import { homedir } from "os";
 import { join } from "path";
 
 export interface SessionState {
@@ -23,7 +23,7 @@ export interface SessionState {
 }
 
 function relayDir(): string {
-  return process.env.RELAY_DIR ?? join(homedir(), ".claude-relay");
+  return process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
 }
 
 export function sessionFilePath(): string {
@@ -61,7 +61,8 @@ export async function saveSession(state: SessionState): Promise<void> {
   await chmod(path, 0o600).catch(() => undefined);
 }
 
-export async function rotateSession(reason: string): Promise<void> {
+export async function rotateSession(reason: string): Promise<SessionState> {
   console.log(`[session] rotate: ${reason}`);
   await unlink(sessionFilePath()).catch(() => undefined);
+  return { sessionId: null, lastActivity: new Date().toISOString() };
 }

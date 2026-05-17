@@ -1515,9 +1515,11 @@
   precisely. `src/session.ts` ported from the audit branch had to be adjusted
   to (a) keep the optional `createdAt` field that main's inline `SessionState`
   carries, (b) call `ensurePrivateDir` before writing the session file (main's
-  inline `saveSession` does), (c) use `rotateSession` as a pure file-side-effect
-  with the caller responsible for reloading in-memory state. Porting verbatim
-  would have dropped `createdAt` and skipped the directory creation.
+  inline `saveSession` does), (c) match main's `HOME || "~"` default relay dir,
+  and (d) have `rotateSession` return a fresh `SessionState` after deleting the
+  file so future relay wiring cannot accidentally keep using a stale in-memory
+  `--resume` id. Porting verbatim would have dropped `createdAt`, skipped the
+  directory creation, and made stale session reuse too easy during integration.
 - Add-ons (Gmail, WhatsApp, Supabase dual-memory, voice reply) stay out of the
   relay's hot path until each has its own draft-only acceptance test. The
   draft-router em-dash gate and iMessage recipient allowlist are the

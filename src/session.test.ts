@@ -55,18 +55,21 @@ test("save + load omits createdAt when absent", async () => {
   expect(s).not.toHaveProperty("createdAt");
 });
 
-test("rotateSession deletes the file (caller reloads)", async () => {
+test("rotateSession deletes the file and returns fresh in-memory state", async () => {
   const mod = await freshSession("rotate");
   await mod.saveSession({ sessionId: "abc-rot", lastActivity: "now" });
-  await mod.rotateSession("test rotation");
+  const rotated = await mod.rotateSession("test rotation");
   const reloaded = await mod.loadSession();
+  expect(rotated.sessionId).toBeNull();
+  expect(typeof rotated.lastActivity).toBe("string");
   expect(reloaded.sessionId).toBeNull();
 });
 
 test("rotateSession when file already absent is a no-op", async () => {
   const mod = await freshSession("rotateAbsent");
-  await mod.rotateSession("noop");
+  const rotated = await mod.rotateSession("noop");
   const s = await mod.loadSession();
+  expect(rotated.sessionId).toBeNull();
   expect(s.sessionId).toBeNull();
 });
 
@@ -112,4 +115,35 @@ test("loadSession narrows non-string sessionId in stored JSON", async () => {
 test("sessionFilePath returns the absolute path under RELAY_DIR", async () => {
   const mod = await freshSession("path");
   expect(mod.sessionFilePath()).toBe(join(workdir, "session.json"));
+});
+
+test("sessionFilePath default matches relay.ts HOME fallback", async () => {
+  const oldHome = process.env.HOME;
+  const fakeHome = join(workdir, "fake-home");
+  delete process.env.RELAY_DIR;
+  process.env.HOME = fakeHome;
+  try {
+    const mod = await freshSession("homeFallback");
+    expect(mod.sessionFilePath()).toBe(join(fakeHome, ".claude-relay", "session.json"));
+  } finally {
+    if (oldHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = oldHome;
+    }
+  }
+});
+
+test("sessionFilePath default uses tilde fallback when HOME is absent", async () => {
+  const oldHome = process.env.HOME;
+  delete process.env.RELAY_DIR;
+  delete process.env.HOME;
+  try {
+    const mod = await freshSession("tildeFallback");
+    expect(mod.sessionFilePath()).toBe(join("~", ".claude-relay", "session.json"));
+  } finally {
+    if (oldHome !== undefined) {
+      process.env.HOME = oldHome;
+    }
+  }
 });
