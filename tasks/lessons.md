@@ -1526,6 +1526,17 @@
   draft-only safety architecture; nothing that produces an outbound action
   bypasses them.
 
+## 2026-05-17 - Pure intent parser as dormant infrastructure
+
+- `src/memory.ts` embeds a REMEMBER/GOAL/DONE parser inside
+  `processMemoryIntents`, which is gated on having a live Supabase client.
+  Adding `src/intents.ts` as a pure parse-only module that strips and captures
+  the same tag set (plus DECISION / EMAIL_DRAFT / IMSG_DRAFT / WHATSAPP_DRAFT)
+  is a draft-only-safe addition: it never writes or sends, and main's runtime
+  path continues to use the embedded `processMemoryIntents`. Future PRs can
+  swap the embedded parser for the standalone module without changing on-the-
+  wire behavior. Land the parser as infrastructure first; integrate later.
+
 ## 2026-05-17 — Compass relay audit integration
 
 - Implement high-risk relay fixes before broad add-ons. Supabase dual-memory,
