@@ -3,21 +3,34 @@
 Date: 2026-05-17  
 Repo: `/Users/williamregan/Projects/claude-telegram-relay`  
 Branch: `relay/anesthesia-corpus-portability`  
-Latest pushed commit: `dd487f1 relay: surface pending iPhone shortcut install`
+Relevant commits:
+
+- `206d2c6 relay: fix dad handoff visibility and Barash typo retrieval`
+- `dd487f1 relay: surface pending iPhone shortcut install`
+- `aa5e72f docs: archive iphone claudedraft handover`
 
 ## Executive Summary
 
-The relay code is now correctly writing iMessage draft handoff data for Dad, and this was verified by sending a real command through the Mac Telegram app UI.
+Final status: resolved and verified end to end.
 
-The remaining failure is iPhone-side:
+The relay code correctly writes iMessage draft handoff data for Dad, the iPhone `ClaudeDraft` shortcut now reads the CloudDocs handoff, and a real Telegram UI command produced a visible iPhone Messages draft to Dad with the expected body.
 
-- `ClaudeDraft.shortcut` still exists in iCloud Drive as a pending install/replace artifact.
-- The iPhone showed the real prompt:
-  `Allow "ClaudeDraft" to access your "claude-relay-drafts" folder?`
-- Before Codex could tap `OK`, iPhone Mirroring disconnected and became stuck at:
-  `Connecting to iPhone 14`
+Do not delete or rewrite the project. The failure was not architectural rot. It was a narrow stack of issues:
 
-Do not treat this as a TypeScript relay failure anymore. The relay produced the correct handoff. The current blocker is completing the iPhone Shortcuts permission/install flow and then deleting the pending install artifact.
+- Dad alias/address-book ambiguity.
+- Misleading Telegram response while the fixed shortcut was still pending installation.
+- iPhone Shortcuts permissions and a stale running shortcut instance.
+- One Mirroir automation mistake caused by loose OCR matching.
+
+The verified working path is now:
+
+```text
+Mac Telegram UI command
+-> launchd relay
+-> latest.json in iCloud Drive
+-> iPhone ClaudeDraft shortcut
+-> Messages draft to Dad
+```
 
 ## What Was Changed In Code
 
@@ -144,7 +157,7 @@ Connecting to
 iPhone 14
 ```
 
-Therefore, the phone-side compose verification could not be completed in this run. Do not mark iPhone Shortcuts as fixed until a real phone compose-body check is observed.
+At that moment, the phone-side compose verification could not be completed. This was later resolved after the user reconnected iPhone Mirroring; see `Final iPhone Verification - Completed` below.
 
 ## Real Telegram UI Test Performed
 
@@ -318,101 +331,185 @@ Fixed ClaudeDraft iPhone install file still exists at /Users/williamregan/Librar
 - The relay no longer claims the iPhone shortcut works while install is pending.
 - No iMessage was sent during testing.
 
-### Not Yet Proved
+### Final iPhone Verification - Completed
 
-The iPhone `ClaudeDraft` shortcut has not yet been verified to open Messages with the body populated after the folder permission prompt.
+After the user reconnected iPhone Mirroring, Codex completed the phone-side verification.
 
-Reason:
+Important details:
+
+- `ClaudeDraft` was visible in Shortcuts.
+- The first automation attempt incorrectly tapped `Quick Look` because loose OCR matching found `OK` inside the words `Quick Look`. This is documented in `tasks/lessons.md`.
+- Codex corrected the approach by matching exact OCR labels and using a screenshot-confirmed tile coordinate.
+- iOS prompted:
 
 ```text
-iPhone Mirroring disconnected and remained stuck at "Connecting to iPhone 14".
+Allow "ClaudeDraft" to send 1 dictionary in a message?
 ```
 
-## Required Next Steps For Claude Code
+Codex tapped `Always Allow`. This does not mean messages auto-send: the installed shortcut still uses Send Message with Show When Run enabled, so the output remains a visible Messages draft requiring manual send.
 
-Do not continue editing relay TypeScript until the iPhone-side verification is completed.
-
-### Step 1 - Reconnect iPhone Mirroring
-
-Get iPhone Mirroring out of:
+The first successful phone-side run opened:
 
 ```text
-Connecting to iPhone 14
-```
-
-Likely manual actions if needed:
-
-1. Unlock the iPhone physically.
-2. Keep it near the Mac.
-3. Confirm Wi-Fi/Bluetooth are on.
-4. Quit and reopen iPhone Mirroring.
-
-### Step 2 - Grant ClaudeDraft Folder Access
-
-Once Mirroir can see the phone again, handle the prompt:
-
-```text
-Allow "ClaudeDraft" to access your "claude-relay-drafts" folder?
-```
-
-Tap:
-
-```text
-OK
-```
-
-### Step 3 - Run ClaudeDraft
-
-On the iPhone:
-
-1. Open Shortcuts.
-2. Tap `ClaudeDraft`.
-3. If iOS asks for Send Message permission, choose `Allow Once`, not `Always Allow`.
-4. Confirm Messages opens with:
-
-```text
-To: Dad / +16048092405
+New iMessage
+To: Dad
 Body: Codex relay verification test - do not send
 ```
 
-Do not tap the send arrow.
+No send button was tapped.
 
-### Step 4 - No-Send Check
-
-Run:
+No-send database proof:
 
 ```bash
 sqlite3 "$HOME/Library/Messages/chat.db" \
   "select count(*) from message where is_from_me=1 and text='Codex relay verification test - do not send' and date > ((strftime('%s','now','-2 hours') - 978307200) * 1000000000);"
 ```
 
-Expected:
+Output:
 
 ```text
 0
 ```
 
-### Step 5 - Remove Pending Install Artifact
+### Final Live Telegram UI Test - Completed
 
-Only after a real iPhone compose-body verification succeeds, delete:
+Codex then moved the pending installer out of iCloud Drive:
 
 ```text
-/Users/williamregan/Library/Mobile Documents/com~apple~CloudDocs/ClaudeDraft.shortcut
+from: /Users/williamregan/Library/Mobile Documents/com~apple~CloudDocs/ClaudeDraft.shortcut
+to:   /Users/williamregan/Downloads/claude-relay-installed-shortcuts/ClaudeDraft.shortcut.installed-2026-05-17-1551
 ```
 
-Then rerun:
+Codex opened the real Mac Telegram app UI:
+
+```bash
+open -a Telegram 'tg://resolve?domain=wr_claude_20260427_bot'
+```
+
+Then sent this real Telegram command through the UI:
+
+```text
+Text dad saying Codex final draft proof - do not send
+```
+
+The relay wrote:
+
+```json
+{
+  "recipient": "+16048092405",
+  "recipient_label": "dad",
+  "body": "Codex final draft proof - do not send",
+  "ts": "2026-05-17T19:52:00.724Z",
+  "body_sha256": "6ab218893af2bc8bed9e35b9448c801bf53cf341d4046864daabfd6d242e6223"
+}
+```
+
+Relay log evidence:
+
+```text
+Message: Text dad saying Codex final draft proof - do not s...
+[imessage-context] contact=dad status=found messages=10 render_context=false placement=true
+[imessage-draft] icloud_drive_file for dad (+16048092405) path=/Users/williamregan/Library/Mobile Documents/com~apple~CloudDocs/claude-relay-drafts/latest.json sha256=6ab218893af2bc8bed9e35b9448c801bf53cf341d4046864daabfd6d242e6223
+```
+
+On iPhone, the previous shortcut run left the `ClaudeDraft` tile in a running state. Codex stopped it by tapping the tile's small stop control, then reran the shortcut. The iPhone opened Messages with:
+
+```text
+New iMessage
+To: Dad
+Body: Codex final draft proof - do not send
+```
+
+Mirroir verdict:
+
+```json
+{
+  "hasMessages": true,
+  "hasDadLabel": true,
+  "hasFinalBody": true,
+  "hasOldBody": false
+}
+```
+
+No send button was tapped.
+
+No-send database proof:
+
+```bash
+sqlite3 "$HOME/Library/Messages/chat.db" \
+  "select count(*) from message where is_from_me=1 and text='Codex final draft proof - do not send' and date > ((strftime('%s','now','-2 hours') - 978307200) * 1000000000);"
+```
+
+Output:
+
+```text
+0
+```
+
+## Verification
+
+### Setup Verify
+
+Command:
 
 ```bash
 bun run setup:verify
 ```
 
-Expected:
+Result:
 
 ```text
-0 failed
+34 passed
+7 warnings
+Your bot is ready!
 ```
 
-Warnings about optional Supabase/voice/check-in services may remain and are not blockers.
+The former blocker is cleared:
+
+```text
+✓ No pending ClaudeDraft iPhone install artifact
+```
+
+Remaining warnings are expected and non-blocking:
+
+- `SUPABASE_URL` not set.
+- optional check-in/briefing launchd services not loaded.
+- voice provider disabled.
+- long-lived Claude Code shell processes found.
+
+### Unit Tests
+
+Command:
+
+```bash
+bun test
+```
+
+Result:
+
+```text
+302 pass
+0 fail
+727 expect() calls
+```
+
+## Required Next Steps For Claude Code
+
+No TypeScript bug fix is required for the Dad/iPhone draft path at this point.
+
+Recommended next actions:
+
+1. Do not rewrite the project.
+2. Do not reintroduce the iCloud installer file unless you intentionally need to replace the iPhone shortcut again.
+3. If the iPhone draft path appears stuck later, check Shortcuts first: if the `ClaudeDraft` tile shows a small running/stop control, stop the stale run before rerunning.
+4. Preserve the Dad alias mapping:
+
+```text
+dad -> +16048092405
+mom -> +16043154583
+```
+
+5. Keep Show When Run enabled in `ClaudeDraft`; the project should draft iMessages, not auto-send them.
 
 ## Staff-Engineer Assessment
 
@@ -425,6 +522,6 @@ The current state is narrow:
 - Telegram polling: working
 - handoff JSON: working
 - iMessage no-send safety: preserved
-- iPhone Shortcut permission/install: still blocked
+- iPhone Shortcut permission/install: working and verified
 
-The correct next action is to finish the iPhone Shortcuts permission/installation flow and verify the compose body on the phone. Rewriting the repo would not fix iOS Shortcuts permission state.
+The correct next action is normal usage plus focused follow-up hardening, not a rewrite. Rewriting the repo would not have fixed the real root causes: contact alias ambiguity, an iOS Shortcuts permission state, and a stale running Shortcuts tile.

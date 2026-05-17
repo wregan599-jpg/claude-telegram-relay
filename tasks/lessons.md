@@ -1685,3 +1685,20 @@
   contributors do not narrow the patterns without weighing the user-side
   tradeoff (terse anesthesia queries like "RSI dosing for rocuronium"
   must keep routing to FTS without explicit textbook framing).
+
+## 2026-05-17 — iPhone Shortcut verification needs exact UI state checks
+
+- Mirroir OCR coordinates are labels, not always the tappable control. A loose
+  regex for `OK` matched the `Quick Look` shortcut label and tapped the wrong
+  tile. For permission prompts, match exact quoted button labels from OCR lines
+  or use fixed coordinates from a screenshot after visual confirmation.
+- When `ClaudeDraft` opens Messages, the Shortcuts tile can remain in a running
+  state with a small stop control. Subsequent taps on the shortcut body may do
+  nothing until that stale run is stopped. If a rerun is needed, return to
+  Shortcuts, tap the stop control in the top-right of the `ClaudeDraft` tile,
+  then tap the tile body again.
+- Keep the iCloud install marker (`~/Library/Mobile Documents/com~apple~CloudDocs/ClaudeDraft.shortcut`)
+  until a real iPhone compose-body verification has been observed. After the
+  phone opens Messages with the expected recipient and body, move or remove the
+  marker and rerun `bun run setup:verify`; otherwise the relay should keep
+  surfacing `phone_shortcut_install_pending`.
