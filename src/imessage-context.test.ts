@@ -262,6 +262,18 @@ test("command-position proper names win over body text that contains 'to <place>
   });
 });
 
+test("command-position lowercase names trigger direct drafts", () => {
+  expect(
+    extractIMessageDraftRequest("Text jacqueline saying where you at?"),
+  ).toEqual({
+    contact: "jacqueline",
+    wantsContext: false,
+    contextLimit: 10,
+    wantsPlacement: true,
+    directBody: "where you at?",
+  });
+});
+
 test("message and ping command-position recipients trigger direct drafts", () => {
   expect(
     extractIMessageDraftRequest("Message Peggy saying thanks"),

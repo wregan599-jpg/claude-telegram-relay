@@ -1702,3 +1702,16 @@
   phone opens Messages with the expected recipient and body, move or remove the
   marker and rerun `bun run setup:verify`; otherwise the relay should keep
   surfacing `phone_shortcut_install_pending`.
+
+## 2026-05-17 — Command-position iMessage names can be lowercase
+
+- Live Telegram command `Text jacqueline saying where you at?` was received
+  by the relay but fell through to the generic Claude path because
+  `COMMAND_POSITION_CONTACT_RE` only accepted capitalized proper names,
+  phone numbers, and emails. Direct draft commands typed on a phone are often
+  lowercase and should not depend on Claude marker compliance.
+- The fix must stay command-position only. Allowing lowercase names in the
+  generic `to/with` branch reintroduces old false positives like "text
+  messages with Peggy" and "Draft a message saying hey". Anchor the lowercase
+  allowance to request-start commands such as `Text`, `Message`, or `Ping`
+  with an optional polite prefix.
