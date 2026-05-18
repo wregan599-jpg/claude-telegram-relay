@@ -351,11 +351,13 @@ async function main() {
     }
 
     const serviceProcessLines = processLines || await getProcessLines();
+    let relayProcessCount = 0;
     if (serviceProcessLines) {
       const relayProcesses = serviceProcessLines.filter((line) =>
         line.includes("bun run src/relay.ts") ||
         /\/bun(?:\s|.*\s)run\s+src\/relay\.ts/.test(line)
       );
+      relayProcessCount = relayProcesses.length;
       if (relayProcesses.length > 1) {
         fail(`Multiple local relay processes found (${relayProcesses.length})`);
       } else if (relayProcesses.length === 1) {
@@ -475,6 +477,17 @@ async function main() {
           // Recording is best-effort; the check still passes for current run.
         }
       }
+
+      // PLAN.md section 3: surface the FDA responsible binary/bundle
+      // explicitly so the user can grant FDA without guessing. Reports the
+      // wrapper bundle ID when present, the realpath otherwise.
+      const wrapperBundleId = env.RELAY_FDA_BUNDLE_ID || "";
+      const fdaTarget = wrapperBundleId
+        ? `${wrapperBundleId} (wrapper bundle)`
+        : currentRealpath;
+      pass(`FDA responsible target: ${fdaTarget}`);
+      pass(`Launchd label: com.claude.telegram-relay`);
+      pass(`Active relay PID count: ${relayProcessCount}`);
     } else {
       warn("Could not resolve Bun realpath; FDA target may drift unnoticed");
     }
