@@ -263,5 +263,63 @@ test("rejects raw body attachment in Send Message content", () => {
   );
 
   expect(result.ok).toBe(false);
-  expect(result.errors.join("\n")).toContain("must wrap the body dictionary value as text");
+  expect(result.errors.join("\n")).toContain("raw WFTextTokenAttachment");
+});
+
+test("rejects Send Message content with multiple attachmentsByRange entries", () => {
+  const base = actions({});
+  const send = base[base.length - 1].WFWorkflowActionParameters as Record<string, unknown>;
+  const content = send.WFSendMessageContent as Record<string, unknown>;
+  const value = content.Value as Record<string, unknown>;
+  value.attachmentsByRange = {
+    "{0, 1}": { OutputUUID: "body", Type: "ActionOutput" },
+    "{2, 1}": { OutputUUID: "other-action", Type: "ActionOutput" },
+  };
+
+  const result = validateClaudeDraftShortcutActions(base, { draftDir });
+
+  expect(result.ok).toBe(false);
+  expect(result.errors.join("\n")).toContain("multiple attachmentsByRange entries");
+});
+
+test("rejects Send Message content with malformed attachmentsByRange key", () => {
+  const base = actions({});
+  const send = base[base.length - 1].WFWorkflowActionParameters as Record<string, unknown>;
+  const content = send.WFSendMessageContent as Record<string, unknown>;
+  const value = content.Value as Record<string, unknown>;
+  value.attachmentsByRange = {
+    "not a range": { OutputUUID: "body", Type: "ActionOutput" },
+  };
+
+  const result = validateClaudeDraftShortcutActions(base, { draftDir });
+
+  expect(result.ok).toBe(false);
+  expect(result.errors.join("\n")).toContain("malformed attachmentsByRange key");
+});
+
+test("rejects Send Message content with no attachmentsByRange at all", () => {
+  const base = actions({});
+  const send = base[base.length - 1].WFWorkflowActionParameters as Record<string, unknown>;
+  const content = send.WFSendMessageContent as Record<string, unknown>;
+  content.Value = { string: "hello" };
+
+  const result = validateClaudeDraftShortcutActions(base, { draftDir });
+
+  expect(result.ok).toBe(false);
+  expect(result.errors.join("\n")).toContain("attachmentsByRange");
+});
+
+test("rejects Send Message content whose attachmentsByRange points at a non-body action", () => {
+  const base = actions({});
+  const send = base[base.length - 1].WFWorkflowActionParameters as Record<string, unknown>;
+  const content = send.WFSendMessageContent as Record<string, unknown>;
+  const value = content.Value as Record<string, unknown>;
+  value.attachmentsByRange = {
+    "{0, 1}": { OutputUUID: "get-file", Type: "ActionOutput" },
+  };
+
+  const result = validateClaudeDraftShortcutActions(base, { draftDir });
+
+  expect(result.ok).toBe(false);
+  expect(result.errors.join("\n")).toContain("wrong action UUID");
 });
