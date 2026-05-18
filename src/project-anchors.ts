@@ -9,6 +9,12 @@
 // Triggered for the 2026-05-11 lawyers/speech turn where FTS didn't surface
 // the Medicolegal-Case notes because the user's message had no shared tokens
 // with the chunks but DID mention Saint Amman / Rob Roy / MIET / lawyers.
+//
+// FOLLOW-UP RISK (PLAN2 / Phase E): this module still issues FTS against the
+// indexer DB synchronously on the relay's main thread. The cap is small and
+// the query is anchor-scoped, but if a future anchor set produces broad-OR or
+// slow scans the relay will stall. Move to the runFtsInWorker pattern from
+// retrieval.ts only if these queries appear in latency/crash logs.
 
 import { Database } from "bun:sqlite";
 import { readFile } from "fs/promises";

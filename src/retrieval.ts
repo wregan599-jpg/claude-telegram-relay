@@ -662,6 +662,7 @@ function filterPathAnchorRows(
 }
 
 export const __test__filterPathAnchorRows = filterPathAnchorRows;
+export const __test__withTimeout = withTimeout;
 
 const MAX_HITS_INJECTED = 3;
 const MAX_CHARS_PER_HIT = 900;
