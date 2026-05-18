@@ -3,6 +3,20 @@
 // competing poller stops instead of waiting through a multi-minute backoff.
 export const TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS = 1_000;
 
+// Bounded retry budget before the relay gives up and exits cleanly. launchd
+// throttle policy (ThrottleInterval=30) then owns the restart cadence so the
+// process never spins indefinitely against a token another consumer holds.
+export const TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS = Number(
+  process.env.RELAY_409_MAX_ATTEMPTS ?? "5",
+);
+
+export function shouldExitAfterTelegramPollingConflict(
+  attempt: number,
+  maxAttempts: number = TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS,
+): boolean {
+  return attempt >= maxAttempts;
+}
+
 export type TelegramPollingConflictKind =
   | "competing_poller"
   | "webhook_active"

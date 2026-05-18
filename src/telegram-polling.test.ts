@@ -1,11 +1,13 @@
 import { expect, test } from "bun:test";
 import {
   TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
+  TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS,
   classifyTelegramPollingConflictError,
   formatTelegramPollingConflictHint,
   formatTelegramPollingConflictLog,
   isTelegramPollingConflictError,
   shouldEscalateTelegramPollingConflict,
+  shouldExitAfterTelegramPollingConflict,
 } from "./telegram-polling";
 
 test("detects Telegram getUpdates 409 conflict objects", () => {
@@ -100,6 +102,21 @@ test("formats token-safe conflict diagnostics", () => {
   expect(line).toContain("attempt=10");
   expect(line).not.toContain("TELEGRAM_BOT_TOKEN");
   expect(line).not.toContain("bot123");
+});
+
+test("polling conflict has a bounded maximum attempt count", () => {
+  expect(TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS).toBeGreaterThan(0);
+  expect(TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS).toBeLessThan(20);
+});
+
+test("shouldExitAfterTelegramPollingConflict returns false below the limit", () => {
+  expect(shouldExitAfterTelegramPollingConflict(1)).toBe(false);
+  expect(shouldExitAfterTelegramPollingConflict(TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS - 1)).toBe(false);
+});
+
+test("shouldExitAfterTelegramPollingConflict returns true at and beyond the limit", () => {
+  expect(shouldExitAfterTelegramPollingConflict(TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS)).toBe(true);
+  expect(shouldExitAfterTelegramPollingConflict(TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS + 5)).toBe(true);
 });
 
 test("formats actionable persistent conflict hints", () => {

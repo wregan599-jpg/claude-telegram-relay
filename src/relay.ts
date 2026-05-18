@@ -12,6 +12,7 @@ import { spawn } from "bun";
 import { constants, existsSync } from "fs";
 import { writeFile, mkdir, readFile, unlink, access, open, chmod, rm } from "fs/promises";
 import { join, dirname, basename, extname } from "path";
+import * as os from "os";
 import { homedir } from "os";
 import { randomUUID } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
@@ -88,11 +89,19 @@ import {
 } from "./telegram-response.ts";
 import {
   TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
+  TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS,
   classifyTelegramPollingConflictError,
   formatTelegramPollingConflictHint,
   formatTelegramPollingConflictLog,
   shouldEscalateTelegramPollingConflict,
+  shouldExitAfterTelegramPollingConflict,
 } from "./telegram-polling.ts";
+import {
+  acquireTokenLock,
+  isLiveRelayPid,
+  releaseTokenLock,
+  tokenLockPath,
+} from "./token-lock.ts";
 import { getSupabaseFeatureConfig } from "./supabase-config.ts";
 import { checkRelayBinaries, archLabel } from "./arch-check.ts";
 
@@ -202,78 +211,51 @@ async function rotateClaudeSessionAfterTimeout(): Promise<void> {
 }
 
 // ============================================================
-// LOCK FILE (prevent multiple instances)
+// LOCK FILE (token-keyed singleton)
 // ============================================================
 
-const LOCK_FILE = join(RELAY_DIR, "bot.lock");
+const TOKEN_LOCK_PATH = tokenLockPath(BOT_TOKEN, RELAY_DIR);
+const RELAY_HOST = process.env.RELAY_HOST || os.hostname();
 
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+let releaseLockOnExit: () => Promise<void> = async () => undefined;
+let stopBotOnExit: () => Promise<void> = async () => undefined;
+
+async function shutdown(reason: string, code = 0): Promise<void> {
   try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
+    await stopBotOnExit();
+  } catch (err) {
+    console.error(`[shutdown] bot stop failed (${reason}):`, err);
   }
-}
-
-async function acquireLock(): Promise<boolean> {
   try {
-    await ensurePrivateDir(RELAY_DIR);
-
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const handle = await open(LOCK_FILE, "wx", 0o600);
-        await handle.writeFile(process.pid.toString(), "utf8");
-        await handle.close();
-        await chmod(LOCK_FILE, 0o600).catch(() => undefined);
-        return true;
-      } catch (err) {
-        if ((err as { code?: string }).code !== "EEXIST") throw err;
-
-        const existingLock = await readFile(LOCK_FILE, "utf-8").catch(() => "");
-        const pid = Number.parseInt(existingLock, 10);
-        if (isProcessAlive(pid)) {
-          console.log(`Another instance running (PID: ${pid})`);
-          return false;
-        }
-
-        console.log("Stale lock found, taking over...");
-        await unlink(LOCK_FILE).catch(() => undefined);
-      }
-    }
-
-    return false;
-  } catch (error) {
-    console.error("Lock error:", error);
-    return false;
+    await releaseLockOnExit();
+  } catch (err) {
+    console.error(`[shutdown] lock release failed (${reason}):`, err);
   }
+  process.exit(code);
 }
 
-async function releaseLock(): Promise<void> {
-  const existingLock = await readFile(LOCK_FILE, "utf-8").catch(() => "");
-  if (Number.parseInt(existingLock, 10) === process.pid) {
-    await unlink(LOCK_FILE).catch(() => {});
-  }
-}
+process.on("SIGINT", () => {
+  shutdown("SIGINT", 0).catch(() => process.exit(0));
+});
+process.on("SIGTERM", () => {
+  shutdown("SIGTERM", 0).catch(() => process.exit(0));
+});
 
-// Cleanup on exit
+// Synchronous safety net: node's "exit" event only fires after all other
+// listeners returned, and async work cannot run inside it. Remove the lock
+// file directly so a crash path still surfaces an empty lock to the next
+// launchd start.
 process.on("exit", () => {
   try {
-    const fs = require("fs");
-    const existingLock = fs.readFileSync(LOCK_FILE, "utf8");
-    if (Number.parseInt(existingLock, 10) === process.pid) {
-      fs.unlinkSync(LOCK_FILE);
+    const fs = require("fs") as typeof import("fs");
+    const raw = fs.readFileSync(TOKEN_LOCK_PATH, "utf8");
+    const parsed = JSON.parse(raw) as { pid?: number };
+    if (parsed?.pid === process.pid) {
+      fs.unlinkSync(TOKEN_LOCK_PATH);
     }
-  } catch {}
-});
-process.on("SIGINT", async () => {
-  await releaseLock();
-  process.exit(0);
-});
-process.on("SIGTERM", async () => {
-  await releaseLock();
-  process.exit(0);
+  } catch {
+    // Lock missing or unreadable: nothing to clean up.
+  }
 });
 
 // ============================================================
@@ -348,13 +330,60 @@ async function saveMessage(
   }
 }
 
-// Acquire lock
-if (!(await acquireLock())) {
-  console.error("Could not acquire lock. Another instance may be running.");
-  process.exit(1);
+// Acquire token-keyed singleton lock. The lock filename is the sha256 prefix
+// of the bot token, so any second relay using the same token (even with a
+// different RELAY_DIR) sees the same lock. The raw token never lands on disk.
+{
+  const lockResult = await acquireTokenLock({
+    token: BOT_TOKEN,
+    host: RELAY_HOST,
+    pid: process.pid,
+    now: new Date(),
+    baseDir: RELAY_DIR,
+    isLiveRelay: (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
+
+  if (!lockResult.ok) {
+    if (lockResult.reason === "held_by_live_relay") {
+      const heldFor = Math.max(
+        0,
+        Math.round((Date.now() - Date.parse(lockResult.holder.started_at)) / 1000),
+      );
+      console.error(
+        `[relay] token lock held by live relay pid=${lockResult.holder.pid} ` +
+        `host=${lockResult.holder.host} held_for_s=${heldFor} ` +
+        `path=${lockResult.path}`,
+      );
+      console.error(
+        "[relay] If that PID is wrong, remove the lock file manually after confirming no other relay is running.",
+      );
+      process.exit(75);
+    } else if (lockResult.reason === "io_error") {
+      console.error(`[relay] token lock IO error: ${lockResult.error}`);
+      process.exit(1);
+    }
+  } else {
+    releaseLockOnExit = async () => {
+      await releaseTokenLock({ token: BOT_TOKEN, pid: process.pid, baseDir: RELAY_DIR });
+    };
+  }
 }
 
 const bot = new Bot(BOT_TOKEN);
+stopBotOnExit = async () => {
+  try {
+    await bot.stop();
+  } catch {
+    // bot.stop() throws if polling never started; safe to ignore at shutdown.
+  }
+};
 
 const seenUpdates: Set<number> = await loadSeenUpdateIds();
 const sentUpdates = new Set<number>();
@@ -1960,6 +1989,24 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function runStartupTelegramProbe(): Promise<void> {
+  try {
+    const me = await bot.api.getMe();
+    console.log(`[telegram] startup probe: getMe ok username=@${me.username} pid=${process.pid}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[telegram] startup probe: getMe failed: ${message}`);
+    throw err;
+  }
+  try {
+    await bot.api.deleteWebhook({ drop_pending_updates: false });
+    console.log("[telegram] startup probe: deleteWebhook ok (idempotent, pending updates preserved)");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[telegram] startup probe: deleteWebhook failed: ${message}`);
+  }
+}
+
 async function startTelegramPolling(): Promise<void> {
   let conflictAttempts = 0;
   let firstConflictAt = 0;
@@ -1990,16 +2037,25 @@ async function startTelegramPolling(): Promise<void> {
           elapsedMs: Date.now() - firstConflictAt,
           pid: process.pid,
           retryDelayMs: TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS,
-          lockFile: LOCK_FILE,
+          lockFile: TOKEN_LOCK_PATH,
           pluginEnvExists,
         }),
       );
       if (shouldEscalateTelegramPollingConflict(conflictAttempts)) {
         console.error(formatTelegramPollingConflictHint({ diagnosis, pluginEnvExists }));
       }
+      if (shouldExitAfterTelegramPollingConflict(conflictAttempts)) {
+        console.error(
+          `[telegram] giving up after ${conflictAttempts}/${TELEGRAM_POLLING_CONFLICT_MAX_ATTEMPTS} ` +
+          "409 attempts; exiting so launchd ThrottleInterval owns restart pacing",
+        );
+        await shutdown("polling_conflict_exhausted", 75);
+        return;
+      }
       await sleep(TELEGRAM_POLLING_CONFLICT_RETRY_DELAY_MS);
     }
   }
 }
 
+await runStartupTelegramProbe();
 await startTelegramPolling();
