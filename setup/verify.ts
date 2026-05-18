@@ -10,6 +10,7 @@
 import { existsSync, readFileSync, statSync } from "fs";
 import { join, dirname, basename } from "path";
 import { homedir } from "os";
+import * as os from "os";
 import {
   DEFAULT_SHORTCUT_NAME,
   defaultICloudDriveDraftDir,
@@ -17,6 +18,12 @@ import {
   isCloudDocsDraftDir,
   validateICloudDriveDraftPayload,
 } from "../src/icloud-drive-draft.ts";
+import { tokenLockPath } from "../src/token-lock.ts";
+import {
+  bunRealpathDriftCheck,
+  parseLaunchdPlistJson,
+  scanRelayLogForRecentFailures,
+} from "./verify-checks.ts";
 import {
   readInstalledShortcutActions,
   readSignedShortcutFileActions,
@@ -294,15 +301,52 @@ async function main() {
       const stderrPath = launchdPrint.stdout.match(/^\s*stderr path = (.+)$/m)?.[1]?.trim();
       if (stdoutPath) pass(`Relay launchd stdout log: ${stdoutPath}`);
       if (stderrPath) pass(`Relay launchd stderr log: ${stderrPath}`);
-      const repoLogsDir = join(PROJECT_ROOT, "logs");
-      if (
-        (stdoutPath && !stdoutPath.startsWith(`${repoLogsDir}/`)) ||
-        (stderrPath && !stderrPath.startsWith(`${repoLogsDir}/`))
-      ) {
-        warn(`Launchd writes active logs outside repo logs/: ${join(RELAY_DIR, "logs")}`);
-      }
     } else {
       warn(`Could not inspect relay launchd log paths: ${launchdPrint.stderr.trim() || launchdPrint.stdout.trim() || `exit ${launchdPrint.code}`}`);
+    }
+
+    // launchd plist policy check
+    const plistPath = join(homedir(), "Library", "LaunchAgents", "com.claude.telegram-relay.plist");
+    if (existsSync(plistPath)) {
+      const plutil = await runCommand(
+        ["plutil", "-convert", "json", "-o", "-", plistPath],
+        { timeoutMs: 5_000 },
+      );
+      if (plutil.code !== 0) {
+        fail(`Could not read launchd plist: ${plutil.stderr.trim() || plutil.stdout.trim()}`);
+      } else {
+        const policy = parseLaunchdPlistJson(plutil.stdout);
+        if (!policy) {
+          fail("Launchd plist JSON did not parse into a recognizable policy");
+        } else {
+          policy.throttleInterval === 30
+            ? pass("Launchd ThrottleInterval=30")
+            : fail(`Launchd ThrottleInterval=${policy.throttleInterval ?? "unset"}, expected 30`);
+          policy.exitTimeOut === 20
+            ? pass("Launchd ExitTimeOut=20")
+            : fail(`Launchd ExitTimeOut=${policy.exitTimeOut ?? "unset"}, expected 20`);
+          if (typeof policy.keepAlive === "object") {
+            const ka = policy.keepAlive as Record<string, unknown>;
+            ka.SuccessfulExit === false && ka.Crashed === true
+              ? pass("Launchd KeepAlive = { SuccessfulExit=false, Crashed=true }")
+              : fail(`Launchd KeepAlive dict has unexpected shape: ${JSON.stringify(ka)}`);
+          } else {
+            fail("Launchd KeepAlive is a boolean; expected { SuccessfulExit=false, Crashed=true } dict");
+          }
+          for (const key of ["RELAY_DIR", "RELAY_LOG_DIR"] as const) {
+            policy.environment[key]
+              ? pass(`Launchd env has ${key}=${policy.environment[key]}`)
+              : fail(`Launchd env missing ${key}`);
+          }
+          if (policy.environment.RELAY_PYTHON) {
+            pass(`Launchd env pins RELAY_PYTHON=${policy.environment.RELAY_PYTHON}`);
+          } else {
+            warn("Launchd env does not pin RELAY_PYTHON (PATH-dependent python3)");
+          }
+        }
+      }
+    } else {
+      warn(`launchd plist not installed at ${plistPath}`);
     }
 
     const serviceProcessLines = processLines || await getProcessLines();
@@ -326,24 +370,112 @@ async function main() {
         warn(`Long-lived Claude Code shell process found (${claudeShells.length}); not the launchd relay`);
       }
 
-      const lockPath = join(RELAY_DIR, "bot.lock");
-      if (existsSync(lockPath)) {
-        const lockPid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
-        const relayPids = relayProcesses
-          .map(pidFromProcessLine)
-          .filter((pid): pid is number => pid !== undefined);
-        if (relayPids.length > 0 && !relayPids.includes(lockPid)) {
-          fail(`bot.lock PID ${lockPid} does not match the running relay process`);
-        } else if (Number.isInteger(lockPid) && lockPid > 0) {
-          pass(`bot.lock PID ${lockPid} is consistent with local relay state`);
-        } else {
-          fail("bot.lock does not contain a valid PID");
-        }
+      const tokenLock = token ? tokenLockPath(token, RELAY_DIR) : undefined;
+      if (!tokenLock) {
+        warn("Cannot check token lock without TELEGRAM_BOT_TOKEN");
+      } else if (!existsSync(tokenLock)) {
+        warn(`Token lock not found at ${tokenLock}; relay may not be running`);
       } else {
-        warn("bot.lock not found; relay may not be running");
+        try {
+          const payload = JSON.parse(readFileSync(tokenLock, "utf8")) as Record<string, unknown>;
+          const lockPid = typeof payload.pid === "number" ? payload.pid : NaN;
+          const lockHost = typeof payload.host === "string" ? payload.host : "?";
+          const relayPids = relayProcesses
+            .map(pidFromProcessLine)
+            .filter((pid): pid is number => pid !== undefined);
+          if (lockHost && lockHost !== os.hostname()) {
+            fail(`Token lock host=${lockHost} differs from this host=${os.hostname()}`);
+          }
+          if (relayPids.length > 0 && !relayPids.includes(lockPid)) {
+            fail(`Token lock PID ${lockPid} does not match the running relay process(es) [${relayPids.join(",")}]`);
+          } else if (Number.isInteger(lockPid) && lockPid > 0) {
+            pass(`Token lock PID ${lockPid} is consistent with local relay state (${tokenLock})`);
+          } else {
+            fail("Token lock payload missing valid pid");
+          }
+        } catch (err) {
+          fail(`Token lock not parseable: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      // Legacy bot.lock should no longer exist after the token-lock cutover.
+      const legacyLockPath = join(RELAY_DIR, "bot.lock");
+      if (existsSync(legacyLockPath)) {
+        warn(`Legacy ${legacyLockPath} still present; remove after the next launchd bootstrap`);
       }
     } else {
       warn("Could not inspect local relay processes");
+    }
+
+    // Recent error-log scan: 409, 401, ERR_INVALID_ARG_VALUE
+    const errorLogPath = join(RELAY_DIR, "logs", "com.claude.telegram-relay.error.log");
+    if (existsSync(errorLogPath)) {
+      try {
+        const log = readFileSync(errorLogPath, "utf8");
+        const scan = scanRelayLogForRecentFailures(log, { lineLimit: 200 });
+        if (scan.hits.length === 0) {
+          pass(`Recent relay error log clean (no 409/401/NUL crash) — ${errorLogPath}`);
+        } else {
+          const summary = scan.hits.reduce<Record<string, number>>((acc, h) => {
+            acc[h.kind] = (acc[h.kind] ?? 0) + 1;
+            return acc;
+          }, {});
+          for (const [kind, count] of Object.entries(summary)) {
+            fail(`Recent relay error log has ${count} ${kind} hits`);
+          }
+        }
+      } catch (err) {
+        warn(`Could not read relay error log: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    } else {
+      warn(`Relay error log not present at ${errorLogPath} (relay may not have run yet)`);
+    }
+
+    // chat.db read probe — fail with exact FDA guidance instead of a vague hint
+    const chatDbPath = join(homedir(), "Library", "Messages", "chat.db");
+    if (existsSync(chatDbPath)) {
+      const probe = await runCommand(
+        ["sqlite3", "-readonly", chatDbPath, "SELECT 1 FROM chat LIMIT 1"],
+        { timeoutMs: 5_000 },
+      );
+      if (probe.code === 0) {
+        pass("iMessage chat.db read probe succeeded (Full Disk Access granted)");
+      } else {
+        const bunRealpath = await runCommand(["readlink", "-f", process.execPath], { timeoutMs: 5_000 });
+        const target = bunRealpath.code === 0 ? bunRealpath.stdout.trim() : process.execPath;
+        fail(
+          `iMessage chat.db read failed: ${probe.stderr.trim() || probe.stdout.trim()}. ` +
+          `Grant Full Disk Access to: ${target}`,
+        );
+      }
+    } else {
+      warn(`No chat.db at ${chatDbPath}; FDA probe skipped`);
+    }
+
+    // Bun realpath stability — record current realpath under
+    // ~/.claude-relay/state/bun-realpath and fail when it drifts.
+    const bunRealpathProbe = await runCommand(["readlink", "-f", process.execPath], { timeoutMs: 5_000 });
+    if (bunRealpathProbe.code === 0) {
+      const currentRealpath = bunRealpathProbe.stdout.trim();
+      const recordPath = join(RELAY_DIR, "state", "bun-realpath");
+      const previousRealpath = existsSync(recordPath) ? readFileSync(recordPath, "utf8").trim() : null;
+      const drift = bunRealpathDriftCheck(currentRealpath, previousRealpath);
+      if (!drift.ok && drift.drifted) {
+        fail(
+          `Bun realpath drifted: was ${previousRealpath}, now ${currentRealpath}. ` +
+          "Re-grant Full Disk Access to the new realpath, then update the record.",
+        );
+      } else {
+        pass(`Bun realpath stable: ${currentRealpath}`);
+        try {
+          require("fs").mkdirSync(dirname(recordPath), { recursive: true, mode: 0o700 });
+          require("fs").writeFileSync(recordPath, currentRealpath, "utf8");
+        } catch {
+          // Recording is best-effort; the check still passes for current run.
+        }
+      }
+    } else {
+      warn("Could not resolve Bun realpath; FDA target may drift unnoticed");
     }
 
     console.log(`\n${bold("  iMessage Handoff")}`);
