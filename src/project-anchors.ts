@@ -122,16 +122,36 @@ export async function findAnchoredProjects(text: string): Promise<AnchorMatch[]>
  * pick out the relevant chunks fast). Results are pulled from the same
  * indexer DB the main retrieval path uses, scoped via `files.path LIKE`.
  */
+export type FtsWorkerRunner = (
+  sql: string,
+  params: unknown[],
+  timeoutMs: number,
+) => Promise<{ rows: unknown[]; ms: number }>;
+
+export interface RetrieveAnchoredContextOptions {
+  runFts?: FtsWorkerRunner;
+  now?: () => number;
+  totalTimeoutMs?: number;
+  perQueryTimeoutMs?: number;
+}
+
 export async function retrieveAnchoredContext(
   matches: AnchorMatch[],
+  options: RetrieveAnchoredContextOptions = {},
 ): Promise<AnchorHit[]> {
   if (matches.length === 0) return [];
 
+  const runFts: FtsWorkerRunner = options.runFts ?? ((sql, params, timeoutMs) =>
+    runFtsInWorker(sql, params, timeoutMs));
+  const now = options.now ?? (() => Date.now());
+  const totalTimeoutMs = options.totalTimeoutMs ?? ANCHOR_TIMEOUT_MS;
+  const perQueryTimeoutMs = options.perQueryTimeoutMs ?? ANCHOR_PER_QUERY_TIMEOUT_MS;
+
   const hits: AnchorHit[] = [];
-  const deadline = Date.now() + ANCHOR_TIMEOUT_MS;
+  const deadline = now() + totalTimeoutMs;
 
   for (const m of matches) {
-    const remainingBudget = deadline - Date.now();
+    const remainingBudget = deadline - now();
     if (remainingBudget <= 0) {
       console.error(`[project-anchors] retrieval deadline reached; skipping ${m.project.name}`);
       break;
@@ -162,11 +182,11 @@ export async function retrieveAnchoredContext(
       LIMIT ${HITS_PER_PROJECT}
     `;
 
-    const queryTimeoutMs = Math.min(ANCHOR_PER_QUERY_TIMEOUT_MS, remainingBudget);
+    const queryTimeoutMs = Math.min(perQueryTimeoutMs, remainingBudget);
     const params: (string | number)[] = [ftsQuery, ...m.project.paths];
 
     try {
-      const { rows } = await runFtsInWorker(sql, params, queryTimeoutMs);
+      const { rows } = await runFts(sql, params, queryTimeoutMs);
       const typed = rows as Array<{
         path: string;
         chunk_index: number;

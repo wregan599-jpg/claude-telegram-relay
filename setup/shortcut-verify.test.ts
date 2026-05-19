@@ -309,6 +309,32 @@ test("rejects Send Message content with no attachmentsByRange at all", () => {
   expect(result.errors.join("\n")).toContain("attachmentsByRange");
 });
 
+test("rejects recipient lookup that explicitly reads from a non-dictionary action", () => {
+  const base = actions({});
+  // Inject WFInput pointing at "get-file" instead of "dictionary"
+  const recipientLookup = base[2].WFWorkflowActionParameters as Record<string, unknown>;
+  recipientLookup.WFInput = {
+    Value: { OutputUUID: "get-file", Type: "ActionOutput" },
+    WFSerializationType: "WFTextTokenAttachment",
+  };
+  const result = validateClaudeDraftShortcutActions(base, { draftDir });
+  expect(result.ok).toBe(false);
+  expect(result.errors.join("\n")).toContain(
+    "recipient dictionary lookup WFInput points at get-file",
+  );
+});
+
+test("accepts recipient lookup with explicit WFInput pointing at the dictionary action", () => {
+  const base = actions({});
+  const recipientLookup = base[2].WFWorkflowActionParameters as Record<string, unknown>;
+  recipientLookup.WFInput = {
+    Value: { OutputUUID: "dictionary", Type: "ActionOutput" },
+    WFSerializationType: "WFTextTokenAttachment",
+  };
+  const result = validateClaudeDraftShortcutActions(base, { draftDir });
+  expect(result.ok).toBe(true);
+});
+
 test("rejects Send Message content whose attachmentsByRange points at a non-body action", () => {
   const base = actions({});
   const send = base[base.length - 1].WFWorkflowActionParameters as Record<string, unknown>;

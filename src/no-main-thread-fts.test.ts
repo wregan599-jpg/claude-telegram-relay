@@ -32,6 +32,14 @@ function listSourceFiles(dir: string): string[] {
   return out;
 }
 
+// Any file outside the allowed set that contains a MATCH against
+// chunks_fts MUST also dispatch through runFtsInWorker. Mentioning MATCH in
+// a SQL string and sending the string to the worker is fine — but
+// constructing a `db.query(...MATCH...)` on the main thread is not.
+const FTS_MATCH_RE = /\bchunks_fts\b[\s\S]{0,200}?\bMATCH\b/i;
+const WORKER_DISPATCH_RE = /\brunFtsInWorker\b/;
+const DB_QUERY_RE = /\b(?:new\s+Database|db\s*\.\s*query|db\s*\.\s*prepare)\b/;
+
 describe("no main-thread FTS call path", () => {
   test("only fts-worker.ts and retrieval.ts import bun:sqlite", () => {
     const files = listSourceFiles(SRC_DIR);
@@ -41,6 +49,27 @@ describe("no main-thread FTS call path", () => {
       if (/from\s+["']bun:sqlite["']/.test(content)) {
         const base = file.slice(SRC_DIR.length + 1);
         if (!ALLOWED_SQLITE_FILES.has(base)) violations.push(base);
+      }
+    }
+    expect(violations).toEqual([]);
+  });
+
+  test("any non-allowed file that mentions a chunks_fts MATCH query must dispatch through runFtsInWorker", () => {
+    const files = listSourceFiles(SRC_DIR);
+    const violations: { file: string; reason: string }[] = [];
+    for (const file of files) {
+      const base = file.slice(SRC_DIR.length + 1);
+      if (ALLOWED_SQLITE_FILES.has(base)) continue;
+      const content = readFileSync(file, "utf8");
+      if (!FTS_MATCH_RE.test(content)) continue;
+      if (!WORKER_DISPATCH_RE.test(content)) {
+        violations.push({ file: base, reason: "mentions chunks_fts MATCH without importing runFtsInWorker" });
+      }
+      if (DB_QUERY_RE.test(content)) {
+        violations.push({
+          file: base,
+          reason: "constructs a main-thread DB handle (new Database / db.query / db.prepare)",
+        });
       }
     }
     expect(violations).toEqual([]);
