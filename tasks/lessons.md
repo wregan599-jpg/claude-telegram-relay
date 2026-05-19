@@ -1808,3 +1808,58 @@ Future contributors must NOT, without first re-reading the Kimi analysis at `tas
 - Replace iCloud Drive transport with a custom server, push notification service, or pairing system.
 
 If you find yourself wanting to do any of the above, the architecture is telling you the problem is somewhere else (a stale text decoder, a brittle parser, a missed cleanup) — fix that instead.
+
+## 2026-05-19 — Token-lock and cutover hardening (PLAN4–PLAN8 distillation)
+
+Five rounds of senior review across PLAN4–PLAN8 surfaced a recurring set of mistakes in lock semantics, error handling, and operator docs. These are the patterns to catch on first pass next time, not on round five.
+
+### Concurrency: atomic-claim over check-then-act
+
+- A `read → decide → write/unlink` flow against a shared file is a TOCTOU window, even when each step looks atomic. The buggy stale-takeover did `readPayloadOrNull → unlink → tryAtomicCreate`; PLAN4's race harness measured 13 double-successes in 500 pairs. The fix is `rename(path, claim-<pid>-<uuid>)` — POSIX-atomic on the source, so only one process wins; everyone else gets ENOENT and bails. Apply the same pattern to release and heartbeat, not just acquire.
+- After winning the atomic claim, verify the file you grabbed matches what you expected to grab (`pid`, `token_hash`, `started_at`/`heartbeat_at`). A third process may have replaced the file between your read and your rename.
+- After the verify passes, recreate via `tryAtomicCreate` (O_EXCL) at the original path. If a third process slipped in during the window between your rename and your recreate, leave their lock alone — do not overwrite. The fix here was `tryRestoreClaim`, which uses `tryAtomicCreate` instead of blind `rename(claim, path)`.
+- Restore-on-mismatch must also be no-overwrite. Blind `rename(claim, path)` during the mismatch branch will destroy whoever raced ahead. Use `tryAtomicCreate(claimed)` and discard the claim if path is occupied. PLAN6 reproduced this exact bug.
+
+### Liveness: PID alone is not enough
+
+- `kill(pid, 0)` is true for any process with that PID. macOS reuses PIDs aggressively. Combine `kill(pid, 0)` with a `ps -o command= -p <pid>` cmdline-contains-relay.ts check before declaring a lock "held by a live relay". The token-lock module's `isLiveRelayPid` does this; the inline `kill` in `relay.ts` did not until N+O.
+- Heartbeat must update the lock atomically so a delayed heartbeat from an old holder cannot clobber a new holder. PLAN5 demonstrated this clobber by hand: read existing → state changes underneath → `rename(tmp, path)` overwrites the new holder. Replace any heartbeat that uses `read-then-writePayloadAtomic` with the same atomic-claim pattern acquire uses.
+- Release has the same race. A's release reads existing=A, pauses (GC, scheduler), B takes over, A's `unlink(path)` deletes B's lock. Fix: atomic claim + verify + unlink-the-claim (not unlink-at-path). Add optional `startedAt` to defend against PID reuse: same PID + host can match between unrelated processes, but `started_at` won't.
+
+### Error handling: silent swallow in long-lived daemons is malpractice
+
+- `.catch(() => undefined)` on a heartbeat interval means the operator's first signal of `ENOSPC`/`EACCES`/`EROFS`/`EIO` is the stale-by-age threshold (120s default) letting a peer take over the lock. The senior post-PLAN7 review found this; AO surfaced it. For a daemon, swallow only the errors you can prove are expected (ENOENT when the lock was already released). Log everything else, even from interval ticks.
+- `tryAtomicCreate` throws on non-`EEXIST` errors (`ENOSPC`, `EROFS`, `EACCES`). Code that wraps it in `.catch(() => undefined)` silently turns disk-full into "heartbeat works fine".
+- TypeScript non-null assertions (`existing!`) lie about runtime state. If `existing` is `null` and you `?? existing!`, the API gets a `null` masquerading as the required type. Always emit a synthetic-but-real value (`makeSyntheticHolder`) rather than casting away nullability.
+
+### Source hygiene: encode controls, don't embed them
+
+- Literal NUL/DEL/BEL bytes baked into `.ts`/`.md` source survived four review rounds (PLAN3 caught them in five files). Test fixtures need NUL? Use `"\x00"` or `String.fromCharCode(0)`. The bytes only exist in the running process, never on disk.
+- Add a repo-hygiene test that fails the build on any tracked file containing `U+0000–U+001F` (except `\t`, `\n`, `\r`) or `U+007F`. See `src/no-control-bytes-in-source.test.ts`. Without it, a stray paste from a terminal re-introduces the regression.
+- The sanitizer must cover C1 controls (`U+0080–U+009F`) in addition to C0 and DEL. PLAN3 caught this; the original regex was scoped to C0 only. Latin-1 supplement (`U+00A0+`) stays.
+- Token redaction must cover both the raw token AND every URL shape that embeds it (`api.telegram.org/bot<TOKEN>/…`, `api.telegram.org/file/bot<TOKEN>/…`). Network errors from `fetch` typically include the full URL in `err.message`. See `src/redact-token.ts`.
+
+### Operator docs and runtime prompt
+
+- `readlink -f` is GNU. macOS shipped it eventually but the operator advice was wrong across multiple docs and lived in the runtime prompt the LLM sees. Replace with `bun run setup:verify` and read the `FDA responsible target` line. `fs.promises.realpath` does the same job in code without spawning a subprocess.
+- TCC attaches grants to resolved inodes, not symlinks. Granting FDA to `~/.bun/bin/bun` or `/opt/homebrew/bin/bun` survives until the next `brew upgrade bun` re-points the symlink to a fresh Cellar inode. Document the resolved Cellar path; have `setup:verify` print it.
+- `setup:verify` should be read-only. Recording state (e.g. `bun-realpath` baseline) during a verify run hides drift — a bun upgrade silently overwrites the recorded baseline instead of failing the next verify. Move the write to `setup:launchd` at install time.
+- The FDA target string must come from the installed launchd plist's `ProgramArguments[0]`, not from env. Env tells you what someone configured; ProgramArguments[0] tells you what launchd will actually execute.
+- Documentation drift recurs. The "the iPhone Shortcut rejects expired drafts" claim survived three review rounds even though the Shortcut never reads `expires_at`. When prose says "X enforces Y", grep the code for evidence that X actually does enforce Y.
+- `FOR ALL USING (true)` is a misnomer. It permits every Postgres role, not just service_role. RLS lockdown needs `FOR ALL TO service_role USING (true) WITH CHECK (true)` with idempotent `DROP POLICY IF EXISTS` guards.
+
+### Dead code lurks after refactors
+
+- After replacing a primitive (e.g. PLAN5's atomic-claim heartbeat replacing `writePayloadAtomic`), grep for the old function's name. If no live caller remains, delete the function and any imports it required. Dead `defaultBaseDir` and `writePayloadAtomic` survived three review rounds before AO removed them.
+- Helper functions with branches that all return the same value (`if (reason === "x") return uuid; return uuid;`) are leftover scaffolding from incomplete refactors. Replace with the simplest expression; add a docstring naming who should call the richer primitive instead.
+
+### Reviewing the reviewer
+
+- Subagent code reviews confabulate. Two of the senior-review subagent's P0 claims in this cycle were false positives: it conflated declaration order with execution order (`findBunSync` "uninitialized" — actually mutated in `main()` before any reader runs) and over-generalized a host-default invariant. Read the actual call sites before acting on agent-flagged findings.
+- The right framing is "trust but verify": let the agent triage, then read the lines yourself. The cost of a false-positive P0 is wasted work and confidence damage; the cost of accepting one is shipping a non-bug "fix" that introduces a new bug.
+
+### Production interface notes carried by AB–AO
+
+- `releaseTokenLock` accepts optional `startedAt`; production must pass `lockResult.payload.started_at` (relay.ts already does). Without it, the PID-reuse defense is silently skipped.
+- `_testHooks` / `_testHookAfterRead` / `_testHookAfterClaim` are part of the production type signatures because TypeScript needs them visible at the call site. Production code must not pass them. They are clearly underscore-prefixed and `_test`-named; if this ever ships in a real path, add a runtime guard.
+- `setup:wrapper` remains experimental. The shell-script-in-`.app` is not a verified TCC identity across macOS versions. Direct Bun realpath FDA is the documented cutover path. Defer wrapper-first rollout until a native Mach-O launcher or `SMAppService` helper exists, or until real-world TCC attribution proves the ad-hoc-signed shell wrapper binds as expected.
