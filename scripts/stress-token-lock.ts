@@ -84,17 +84,22 @@ async function main(): Promise<void> {
   let totalDouble = 0;
   let totalZero = 0;
   let totalIoErrors = 0;
+  let totalExactOne = 0;
 
   for (let trial = 0; trial < PAIR_COUNT; trial++) {
     const result = await runOnePair(trial);
     if (result.successes === 2) {
       totalDouble += 1;
-      console.error(`trial ${trial}: TWO acquires won — race regressed`);
-    } else if (result.successes === 0 && result.ioErrors === 0) {
+      console.error(`trial ${trial}: TWO acquires won - race regressed`);
+    } else if (result.ioErrors > 0) {
+      totalIoErrors += result.ioErrors;
+      console.error(`trial ${trial}: IO error result observed - verification failed`);
+    } else if (result.successes === 0) {
       totalZero += 1;
-      console.error(`trial ${trial}: ZERO acquires won and no IO error — unexpected`);
+      console.error(`trial ${trial}: ZERO acquires won - unexpected`);
+    } else {
+      totalExactOne += 1;
     }
-    totalIoErrors += result.ioErrors;
     if ((trial + 1) % 100 === 0) {
       const elapsed = performance.now() - t0;
       console.log(
@@ -107,12 +112,12 @@ async function main(): Promise<void> {
   const elapsed = performance.now() - t0;
   console.log("");
   console.log(`done in ${elapsed.toFixed(0)}ms`);
-  console.log(`  exactly-one winners: ${PAIR_COUNT - totalDouble - totalZero}`);
+  console.log(`  exactly-one winners: ${totalExactOne}`);
   console.log(`  double winners:      ${totalDouble}`);
   console.log(`  zero winners:        ${totalZero}`);
   console.log(`  io_error results:    ${totalIoErrors}`);
 
-  if (totalDouble > 0 || totalZero > 0) {
+  if (totalDouble > 0 || totalZero > 0 || totalIoErrors > 0) {
     console.error("FAIL: lock race regressed");
     process.exit(1);
   }

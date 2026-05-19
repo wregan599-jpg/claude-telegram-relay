@@ -107,6 +107,7 @@ import {
 } from "./token-lock.ts";
 import { getSupabaseFeatureConfig } from "./supabase-config.ts";
 import { checkRelayBinaries, archLabel } from "./arch-check.ts";
+import { rotateLogIfTooLarge } from "./log-rotation.ts";
 
 const PROJECT_ROOT = dirname(dirname(import.meta.path));
 
@@ -299,6 +300,29 @@ try {
 await ensurePrivateDir(RELAY_DIR);
 await ensurePrivateDir(TEMP_DIR);
 await ensurePrivateDir(UPLOADS_DIR);
+
+// Rotate the launchd stderr log if it grew past the threshold. launchd
+// owns the StandardErrorPath fd, so the rotator uses copy-and-truncate
+// rather than rename. Failures must never block startup — the rotator
+// is observability, not a runtime dependency.
+{
+  const errorLogPath = join(
+    process.env.RELAY_LOG_DIR || join(RELAY_DIR, "logs"),
+    "com.claude.telegram-relay.error.log",
+  );
+  const maxBytes = positiveIntEnv("RELAY_ERROR_LOG_ROTATE_MAX_BYTES", 5 * 1024 * 1024);
+  try {
+    const result = await rotateLogIfTooLarge({ path: errorLogPath, maxBytes });
+    if (result.rotated) {
+      console.log(
+        `[log-rotation] rotated relay error log path=${result.path} archive=${result.archivePath} size_bytes=${result.sizeBytes}`,
+      );
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[log-rotation] rotation failed (continuing startup): ${message}`);
+  }
+}
 
 // ============================================================
 // SUPABASE (optional — only if configured)

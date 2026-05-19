@@ -1863,3 +1863,35 @@ Five rounds of senior review across PLAN4–PLAN8 surfaced a recurring set of mi
 - `releaseTokenLock` accepts optional `startedAt`; production must pass `lockResult.payload.started_at` (relay.ts already does). Without it, the PID-reuse defense is silently skipped.
 - `_testHooks` / `_testHookAfterRead` / `_testHookAfterClaim` are part of the production type signatures because TypeScript needs them visible at the call site. Production code must not pass them. They are clearly underscore-prefixed and `_test`-named; if this ever ships in a real path, add a runtime guard.
 - `setup:wrapper` remains experimental. The shell-script-in-`.app` is not a verified TCC identity across macOS versions. Direct Bun realpath FDA is the documented cutover path. Defer wrapper-first rollout until a native Mach-O launcher or `SMAppService` helper exists, or until real-world TCC attribution proves the ad-hoc-signed shell wrapper binds as expected.
+
+## 2026-05-19 - PLAN10: observability and runtime hygiene
+
+### launchd stderr rotation must be copy-and-truncate
+
+- launchd opens `StandardErrorPath` with `O_APPEND` and keeps that fd for the relay's lifetime. `rename(path, archive)` would move the inode out from under the fd: launchd keeps writing to the moved file while the live path looks empty. `src/log-rotation.ts` uses `copyFile(path, archive)` followed by `truncate(path, 0)`. O_APPEND drives the next launchd write back to byte 0 of the now-empty file.
+- Be honest about the contract: this is best-effort observability hygiene, not lossless concurrent archival. A line appended by the relay between `copyFile` and `truncate(path, 0)` can be absent from both the archive and the active log. The rotator runs once at startup before the bot begins polling, so the race window is small, but call sites must not assume zero loss.
+- Rotation failures log a warning and startup continues; the rotator is never a runtime dependency.
+- Threshold is `RELAY_ERROR_LOG_ROTATE_MAX_BYTES`, default 5 MiB. Decision logs are out of scope; rotating them belongs in a later pass if disk usage demands it.
+
+### Health checks must be read-only and reuse verifier predicates
+
+- `setup/health-check.ts` owns the relay-process predicate, the token-lock health check, and the recent-error-log scan. `setup/verify.ts` imports those helpers so the predicate has exactly one definition. The next predicate change lands in one file, not two.
+- Read-only means no log deletion, no lock rewrites, no `launchctl bootstrap/bootout/kickstart`, and no `.env` writes. A monitor that mutates state is not a monitor; if a future check wants to repair state, it belongs in a separate tool, not folded into the read-only path.
+- Standalone exit codes are tiered: `0` no failures, `1` runtime health failure, `2` configuration error (currently missing `TELEGRAM_BOT_TOKEN`). The config tier is separate so callers can route `exit 2` to a "fix .env" hint without parsing log lines.
+
+### Stress harnesses must fail on every documented failure class
+
+- `scripts/stress-token-lock.ts` tracked `totalIoErrors` but never gated on it. A trial returning `successes=1, ioErrors=1` (the rare ENOSPC or EACCES branch) silently counted as a clean exactly-one winner and the harness reported PASS. Any harness whose docs name a failure mode must fail when that mode fires, or the docs are lying.
+- Track exact-one winners with an explicit counter (`totalExactOne`). Arithmetic-derived counts like `total - doubles - zeros` hide newly-introduced failure classes the same way they hide bugs.
+
+### `setup:verify` stays the operator-facing gate
+
+- PLAN10 folds health-check output into `setup:verify` rather than shipping a parallel workflow. The standalone CLI at `scripts/health-check.ts` exists for scripting and spot checks, but `setup:verify` remains the canonical operator entry point. Operators should not need two command names to learn one fact.
+- Verify calls the shared check in `mode: "embedded"` so zero relay processes stays advisory (warn). The standalone CLI runs in `mode: "standalone"` where zero relays is a hard fail. Same logic, different exit policy at the boundary.
+
+### Verifier truthfulness: never confuse "saw nothing" with "confirmed absence"
+
+- Embedded "no relay" warnings must escalate to fails when launchd reports the job as loaded. A passing verify with `launchdRelayLoaded && relayProcessCount === 0` is a false-green readiness claim. `checkSingletonRelay` now accepts `launchdRelayLoaded` and the `Active relay PID count: 0` summary line follows the same policy: fail when launchd is loaded, warn when it is not, never an unconditional pass.
+- Relay-process detection must inspect argv, not substrings. The previous predicate accepted any ps line containing `bun run src/relay.ts`, which means `grep "bun run src/relay.ts"`, `rg "bun run src/relay.ts"`, and `/bin/sh -c 'echo bun run src/relay.ts'` all looked like a live relay. The strict predicate splits on whitespace and requires `<bun-exe> run src/relay.ts` in the argv slots.
+- Log scanning must follow the path the running job is actually writing to, not the plist on disk or the verifier's environment. `defaultErrorLogPath(process.env)` ignored launchd entirely, so a custom `RELAY_LOG_DIR` in the launchd job let the scanner read an empty file and report "clean" while the real error log filled with `409`s. `resolveRelayErrorLogPath` now ranks live `launchctl print` stderr (the bootstrapped job's actual fd target) above the installed plist `StandardErrorPath` (what disk says should be used), then the `RELAY_LOG_DIR` and `.env` tiers.
+- The installed plist on disk can drift from the bootstrapped launchd job. If someone edits the plist file but never re-bootstraps, `launchctl print` reports one stderr path while `parseLaunchdPlistJson(plist)` reports another. Trusting only the plist hides real error evidence written to the live path. Keep `liveLaunchdStandardErrorPath` and `launchdPlistStandardErrorPath` as separate variables so the plist parse cannot overwrite the live signal.

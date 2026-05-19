@@ -24,13 +24,19 @@ import {
   isCloudDocsDraftDir,
   validateICloudDriveDraftPayload,
 } from "../src/icloud-drive-draft.ts";
-import { tokenLockPath } from "../src/token-lock.ts";
+import { tokenHash, tokenLockPath } from "../src/token-lock.ts";
 import { redactBotToken } from "../src/redact-token.ts";
 import {
   bunRealpathDriftCheck,
   parseLaunchdPlistJson,
-  scanRelayLogForRecentFailures,
 } from "./verify-checks.ts";
+import {
+  buildHealthReport,
+  findRelayProcesses,
+  loadErrorLogState,
+  loadTokenLockState,
+  resolveRelayErrorLogPath,
+} from "./health-check.ts";
 import {
   readInstalledShortcutActions,
   readSignedShortcutFileActions,
@@ -119,11 +125,6 @@ async function getProcessLines(): Promise<string[] | undefined> {
   const result = await runCommand(["/bin/ps", "axww", "-o", "pid=,etime=,command="]);
   if (result.code !== 0) return undefined;
   return result.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
-}
-
-function pidFromProcessLine(line: string): number | undefined {
-  const pid = Number.parseInt(line.trim().split(/\s+/, 1)[0], 10);
-  return Number.isInteger(pid) && pid > 0 ? pid : undefined;
 }
 
 // Load .env
@@ -345,11 +346,19 @@ async function main() {
     }
 
     console.log(`\n${bold("  Services (launchd)")}`);
+    let launchdRelayLoaded = false;
     for (const label of ["com.claude.telegram-relay", "com.claude.smart-checkin", "com.claude.morning-briefing"]) {
       const result = await runCommand(["launchctl", "list", label], { timeoutMs: 5_000 });
       result.code === 0 ? pass(`${label} loaded`) : warn(`${label} not loaded`);
+      if (label === "com.claude.telegram-relay" && result.code === 0) {
+        launchdRelayLoaded = true;
+      }
     }
+    let launchdPlistStandardErrorPath: string | undefined;
+    let launchdEnvLogDir: string | undefined;
+    let launchdEnvRelayDir: string | undefined;
 
+    let launchdLiveStandardErrorPath: string | undefined;
     const launchdPrint = await runCommand(
       ["launchctl", "print", `gui/${process.getuid()}/com.claude.telegram-relay`],
       { timeoutMs: 5_000 },
@@ -358,7 +367,13 @@ async function main() {
       const stdoutPath = launchdPrint.stdout.match(/^\s*stdout path = (.+)$/m)?.[1]?.trim();
       const stderrPath = launchdPrint.stdout.match(/^\s*stderr path = (.+)$/m)?.[1]?.trim();
       if (stdoutPath) pass(`Relay launchd stdout log: ${stdoutPath}`);
-      if (stderrPath) pass(`Relay launchd stderr log: ${stderrPath}`);
+      if (stderrPath) {
+        // launchctl prints "(null)" when the bootstrapped job has no
+        // StandardErrorPath; treat that as no live path so the resolver
+        // falls back to the plist tier.
+        if (stderrPath !== "(null)") launchdLiveStandardErrorPath = stderrPath;
+        pass(`Relay launchd stderr log: ${stderrPath}`);
+      }
     } else {
       warn(`Could not inspect relay launchd log paths: ${launchdPrint.stderr.trim() || launchdPrint.stdout.trim() || `exit ${launchdPrint.code}`}`);
     }
@@ -376,6 +391,9 @@ async function main() {
         if (!policy) {
           fail("Launchd plist JSON did not parse into a recognizable policy");
         } else {
+          launchdPlistStandardErrorPath = policy.standardErrorPath;
+          launchdEnvLogDir = policy.environment.RELAY_LOG_DIR;
+          launchdEnvRelayDir = policy.environment.RELAY_DIR;
           policy.throttleInterval === 30
             ? pass("Launchd ThrottleInterval=30")
             : fail(`Launchd ThrottleInterval=${policy.throttleInterval ?? "unset"}, expected 30`);
@@ -409,19 +427,12 @@ async function main() {
     const serviceProcessLines = processLines || await getProcessLines();
     let relayProcessCount = 0;
     if (serviceProcessLines) {
-      const relayProcesses = serviceProcessLines.filter((line) =>
-        line.includes("bun run src/relay.ts") ||
-        /\/bun(?:\s|.*\s)run\s+src\/relay\.ts/.test(line)
-      );
+      const relayProcesses = findRelayProcesses(serviceProcessLines);
       relayProcessCount = relayProcesses.length;
-      if (relayProcesses.length > 1) {
-        fail(`Multiple local relay processes found (${relayProcesses.length})`);
-      } else if (relayProcesses.length === 1) {
-        pass("Exactly one local relay process found");
-      } else {
-        warn("No local relay process found");
-      }
 
+      // Long-lived `claude --dangerously-skip-permissions` shells are not
+      // the launchd relay but can confuse operators looking at ps output.
+      // This is not part of the read-only health check; verify owns it.
       const claudeShells = serviceProcessLines.filter((line) =>
         /\bclaude --dangerously-skip-permissions\b/.test(line)
       );
@@ -429,45 +440,40 @@ async function main() {
         warn(`Long-lived Claude Code shell process found (${claudeShells.length}); not the launchd relay`);
       }
 
-      const tokenLock = token ? tokenLockPath(token) : undefined;
-      const relayLive = relayProcesses.length >= 1;
-      if (!tokenLock) {
-        warn("Cannot check token lock without TELEGRAM_BOT_TOKEN");
-      } else if (!existsSync(tokenLock)) {
-        // PLAN6: when a relay is actually running and a token is
-        // configured, missing token lock is a FAIL — the relay should
-        // have created one at startup. Only warn when no relay is alive
-        // (the lock is expected to be absent during pre-cutover state).
-        if (relayLive) {
-          fail(
-            `Token lock missing at ${tokenLock} but a relay process is running. ` +
-            "Pre-PLAN-A code path that never created the new lock is still live; " +
-            "complete the cutover.",
-          );
-        } else {
-          warn(`Token lock not found at ${tokenLock}; relay may not be running`);
+      // Shared health checks: singleton, token-lock, recent error log.
+      // Embedded mode keeps zero relays advisory unless launchd reports
+      // the job is loaded, in which case zero relays is a hard fail.
+      if (token) {
+        const lockPath = tokenLockPath(token);
+        const errorLogPath = resolveRelayErrorLogPath({
+          launchdLiveStandardErrorPath,
+          launchdPlistStandardErrorPath,
+          launchdEnvLogDir,
+          launchdEnvRelayDir,
+          dotenvLogDir: env.RELAY_LOG_DIR,
+          dotenvRelayDir: env.RELAY_DIR,
+          homeDir: homedir(),
+        });
+        const report = buildHealthReport({
+          mode: "embedded",
+          launchdRelayLoaded,
+          tokenConfigured: true,
+          processLines: serviceProcessLines,
+          tokenLockState: loadTokenLockState(lockPath),
+          lockPath,
+          expectedHost: os.hostname(),
+          expectedTokenHash: tokenHash(token),
+          now: new Date(),
+          errorLog: loadErrorLogState(errorLogPath),
+          errorLogPath,
+        });
+        for (const line of report.lines) {
+          if (line.severity === "pass") pass(line.message);
+          else if (line.severity === "warn") warn(line.message);
+          else fail(line.message);
         }
       } else {
-        try {
-          const payload = JSON.parse(readFileSync(tokenLock, "utf8")) as Record<string, unknown>;
-          const lockPid = typeof payload.pid === "number" ? payload.pid : NaN;
-          const lockHost = typeof payload.host === "string" ? payload.host : "?";
-          const relayPids = relayProcesses
-            .map(pidFromProcessLine)
-            .filter((pid): pid is number => pid !== undefined);
-          if (lockHost && lockHost !== os.hostname()) {
-            fail(`Token lock host=${lockHost} differs from this host=${os.hostname()}`);
-          }
-          if (relayPids.length > 0 && !relayPids.includes(lockPid)) {
-            fail(`Token lock PID ${lockPid} does not match the running relay process(es) [${relayPids.join(",")}]`);
-          } else if (Number.isInteger(lockPid) && lockPid > 0) {
-            pass(`Token lock PID ${lockPid} is consistent with local relay state (${tokenLock})`);
-          } else {
-            fail("Token lock payload missing valid pid");
-          }
-        } catch (err) {
-          fail(`Token lock not parseable: ${err instanceof Error ? err.message : String(err)}`);
-        }
+        warn("Cannot run relay health checks without TELEGRAM_BOT_TOKEN");
       }
 
       // Legacy bot.lock must not exist after the token-lock cutover.
@@ -480,30 +486,6 @@ async function main() {
       }
     } else {
       warn("Could not inspect local relay processes");
-    }
-
-    // Recent error-log scan: 409, 401, ERR_INVALID_ARG_VALUE
-    const errorLogPath = join(RELAY_DIR, "logs", "com.claude.telegram-relay.error.log");
-    if (existsSync(errorLogPath)) {
-      try {
-        const log = readFileSync(errorLogPath, "utf8");
-        const scan = scanRelayLogForRecentFailures(log, { lineLimit: 200 });
-        if (scan.hits.length === 0) {
-          pass(`Recent relay error log clean (no 409/401/NUL crash) — ${errorLogPath}`);
-        } else {
-          const summary = scan.hits.reduce<Record<string, number>>((acc, h) => {
-            acc[h.kind] = (acc[h.kind] ?? 0) + 1;
-            return acc;
-          }, {});
-          for (const [kind, count] of Object.entries(summary)) {
-            fail(`Recent relay error log has ${count} ${kind} hits`);
-          }
-        }
-      } catch (err) {
-        warn(`Could not read relay error log: ${err instanceof Error ? err.message : String(err)}`);
-      }
-    } else {
-      warn(`Relay error log not present at ${errorLogPath} (relay may not have run yet)`);
     }
 
     // chat.db read probe — fail with exact FDA guidance instead of a vague hint
@@ -561,7 +543,18 @@ async function main() {
     // FDA, which is the same realpath we report above. The wrapper is
     // tracked for a future native-Mach-O or SMAppService rollout.
     pass(`Launchd label: com.claude.telegram-relay`);
-    pass(`Active relay PID count: ${relayProcessCount}`);
+    // PID-count line tracks the singleton-relay policy: a count of 1 is
+    // a pass; a count of 0 is a fail when launchd thinks the job is
+    // loaded and a warning otherwise; >1 is a fail (already covered by
+    // the singleton check above, repeated here for the summary).
+    const pidCountMsg = `Active relay PID count: ${relayProcessCount}`;
+    if (relayProcessCount === 1) {
+      pass(pidCountMsg);
+    } else if (relayProcessCount === 0) {
+      launchdRelayLoaded ? fail(pidCountMsg) : warn(pidCountMsg);
+    } else {
+      fail(pidCountMsg);
+    }
 
     console.log(`\n${bold("  iMessage Handoff")}`);
     const shortcutName = env.RELAY_IMESSAGE_SHORTCUT_NAME || DEFAULT_SHORTCUT_NAME;

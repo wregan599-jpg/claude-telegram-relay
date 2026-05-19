@@ -7,6 +7,7 @@
     "dev": "bun run --watch src/relay.ts",
     "test": "bun test",
     "test:smoke": "bun run scripts/smoke-poison-query.ts && bun run scripts/smoke-textbook-retrieval.ts",
+    "health": "bun run scripts/health-check.ts",
     "verify": "bun test && bun run test:smoke && bun run setup:verify",
     "setup": "bun run setup/install.ts",
     "test:telegram": "bun run setup/test-telegram.ts",
