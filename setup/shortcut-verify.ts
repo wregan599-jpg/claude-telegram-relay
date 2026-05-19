@@ -97,9 +97,12 @@ function inspectTextToken(token: unknown): InspectedToken {
 }
 
 function outputUuidFromToken(token: unknown): string | undefined {
-  const inspected = inspectTextToken(token);
-  if (inspected.reason === "raw_attachment") return inspected.uuid;
-  return inspected.uuid;
+  // inspectTextToken returns the OutputUUID for both the raw_attachment
+  // shape (used by the recipient field) and the well-formed
+  // WFTextTokenString shape (used by the body field). Callers that need
+  // to distinguish should call inspectTextToken directly and check
+  // `reason` — see the body lookup in validateClaudeDraftShortcutActions.
+  return inspectTextToken(token).uuid;
 }
 
 function expectedCloudRelativeDir(draftDir: string): string | undefined {

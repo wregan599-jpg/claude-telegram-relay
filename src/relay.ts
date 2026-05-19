@@ -392,6 +392,7 @@ async function saveMessage(
     stopLockHeartbeat = startTokenLockHeartbeat({
       token: BOT_TOKEN,
       pid: process.pid,
+      host: RELAY_HOST,
     });
   }
 }

@@ -11,7 +11,7 @@
 // the payload and use the first 16 hex chars in the filename.
 
 import { createHash, randomUUID } from "crypto";
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from "fs/promises";
+import { chmod, mkdir, readFile, rename, unlink } from "fs/promises";
 import { existsSync, openSync, closeSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
@@ -33,10 +33,6 @@ export type AcquireTokenLockResult =
   | { ok: true; path: string; payload: TokenLockPayload }
   | { ok: false; reason: "held_by_live_relay"; holder: TokenLockPayload; path: string }
   | { ok: false; reason: "io_error"; error: string };
-
-function defaultBaseDir(): string {
-  return process.env.RELAY_DIR || join(homedir(), ".claude-relay");
-}
 
 /**
  * Token locks must live in a host-global directory, independent of
@@ -104,15 +100,6 @@ function makeSyntheticHolder(input: {
     started_at: input.now.toISOString(),
     heartbeat_at: input.now.toISOString(),
   };
-}
-
-async function writePayloadAtomic(path: string, payload: TokenLockPayload): Promise<void> {
-  const dir = join(path, "..");
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  await writeFile(tmp, JSON.stringify(payload, null, 2) + "\n", { mode: 0o600 });
-  await chmod(tmp, 0o600).catch(() => undefined);
-  await rename(tmp, path);
 }
 
 /**
@@ -396,8 +383,15 @@ export async function heartbeatTokenLock(input: {
   try {
     await rename(path, claimPath);
   } catch (err) {
-    // ENOENT: lock no longer exists; abandon the heartbeat.
-    if ((err as { code?: string }).code === "ENOENT") return;
+    const code = (err as { code?: string }).code;
+    // ENOENT: lock no longer exists; the relay was already released or
+    // taken over. Abandon the heartbeat silently — this is expected.
+    if (code === "ENOENT") return;
+    // Anything else (EACCES, EIO, EROFS) is unexpected and is a precursor
+    // to the stale-by-age threshold letting a peer take over the token.
+    // Make it visible so the operator can act before the takeover lands.
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[token-lock] heartbeat rename failed: code=${code ?? "?"} ${message}`);
     return;
   }
 
@@ -435,6 +429,12 @@ export function startTokenLockHeartbeat(input: {
   token: string;
   pid: number;
   baseDir?: string;
+  /**
+   * Optional host string; when supplied, the heartbeat refuses to update
+   * a lock whose payload host doesn't match. Mirrors releaseTokenLock's
+   * defense-in-depth check.
+   */
+  host?: string;
   intervalMs?: number;
   now?: () => Date;
 }): () => void {
@@ -447,8 +447,16 @@ export function startTokenLockHeartbeat(input: {
       token: input.token,
       pid: input.pid,
       baseDir: input.baseDir,
+      host: input.host,
       now: nowFn(),
-    }).catch(() => undefined);
+    }).catch((err) => {
+      // heartbeatTokenLock handles ENOENT internally; anything that
+      // escapes this catch arm is a programming bug or an unexpected
+      // filesystem error (ENOSPC, EROFS, JSON parse). Log so the
+      // operator sees it before stale-by-age lets a peer take over.
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`[token-lock] heartbeat tick failed: ${message}`);
+    });
   }, intervalMs);
   // Don't keep the event loop alive for the heartbeat alone — let normal
   // shutdown paths drive the process exit.
