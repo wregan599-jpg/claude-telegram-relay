@@ -492,15 +492,15 @@ test("strips NUL and other unsafe control characters from rendered context", () 
     request: { contact: "Bro", limit: 10 },
     status: "found",
     messages: [
-      { id: 1, sender: "me", ts: "2026-05-15 09:00:00", text: " All good bro, can do!" },
-      { id: 2, sender: "them", ts: "2026-05-15 09:01:00", text: "ok sounds great" },
+      { id: 1, sender: "me", ts: "2026-05-15 09:00:00", text: "\x00All good bro, can do!" },
+      { id: 2, sender: "them", ts: "2026-05-15 09:01:00", text: "ok\x07 sounds great\x7f" },
     ],
   };
 
   const rendered = renderIMessageContext(result);
-  expect(rendered).not.toContain(" ");
-  expect(rendered).not.toContain("");
-  expect(rendered).not.toContain("");
+  expect(rendered).not.toContain("\x00");
+  expect(rendered).not.toContain("\x07");
+  expect(rendered).not.toContain("\x7f");
   expect(rendered).toContain("me: All good bro, can do!");
   expect(rendered).toContain("them: ok sounds great");
 });
